@@ -68,7 +68,13 @@ export SECOND_BRAIN_DIR="$HOME/path/to/your/notes"
 
 - `jq`
 - `python3`
+- `shasum` (macOS 標準)
 - `recall` (Claude Code CLI に付属)
+
+## 注意
+
+- `SECOND_BRAIN_DIR` には**絶対パス**を指定し、**シンボリックリンクではない**ディレクトリを使うこと
+- スクリプトは symlink の保存先を拒否する安全機構を持っている
 
 ## テスト
 

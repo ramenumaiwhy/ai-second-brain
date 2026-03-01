@@ -446,7 +446,7 @@ print(safe)
         echo "  - \"$escaped_source\""
         echo "---"
         echo ""
-        echo "# $title"
+        printf '# %s\n' "$(printf '%s' "$title" | tr -d '\n\r')"
         echo ""
 
         # #7: 複数行メッセージ対応 + jqループ排除
@@ -491,6 +491,11 @@ for m in data.get('messages', []):
 }
 
 # メイン処理
+# symlink 拒否（書き込み先乗っ取り防止）
+if [ -L "$OBSIDIAN_DIR" ]; then
+    echo "$(date): $OBSIDIAN_DIR is a symlink, aborting" >> "$SYNC_LOG"
+    exit 1
+fi
 mkdir -p "$OBSIDIAN_DIR"
 
 if ! acquire_lock; then

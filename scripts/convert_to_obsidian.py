@@ -123,6 +123,9 @@ def main():
     if not output_dir or not output_dir.is_dir():
         print('Error: SECOND_BRAIN_DIR is not set or does not exist.', file=sys.stderr)
         sys.exit(1)
+    if output_dir.is_symlink():
+        print('Error: SECOND_BRAIN_DIR is a symlink, aborting.', file=sys.stderr)
+        sys.exit(1)
 
     # 出力ディレクトリ作成
     output_dir.mkdir(parents=True, exist_ok=True)

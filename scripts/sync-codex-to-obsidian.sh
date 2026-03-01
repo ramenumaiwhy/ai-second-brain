@@ -637,7 +637,7 @@ print('untitled')
         printf '%s\n' "  - codex"
         printf '%s\n' "---"
         printf '\n'
-        printf '# %s\n' "$title"
+        printf '# %s\n' "$(printf '%s' "$title" | tr -d '\n\r')"
         printf '\n'
 
         format_messages_as_markdown "$messages_json" 0 0 0
