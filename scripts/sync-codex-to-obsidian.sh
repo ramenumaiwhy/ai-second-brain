@@ -1,6 +1,6 @@
 #!/bin/bash
 # Codex セッション → Obsidian 同期スクリプト
-# Claude Code の Stop hook から呼ばれる
+# 明示保存、idle sync、daily recovery から呼ばれる
 
 set -euo pipefail
 
@@ -26,10 +26,15 @@ for cmd in jq python3; do
 done
 
 CODEX_SESSIONS_DIR="${CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
+TARGET_JSONL="${1:-}"
 OBSIDIAN_DIR="${SECOND_BRAIN_DIR:?'Error: SECOND_BRAIN_DIR is not set. Set it to your notes directory.'}"
 SYNC_LOG="$HOME/.claude/codex-sync.log"
 LOCK_DIR="$HOME/.claude/codex-obsidian-sync.lock"
 SID_INDEX="$HOME/.claude/codex-sid-index.tsv"
+SYNC_BUSY_EXIT_CODE="${SYNC_BUSY_EXIT_CODE:-0}"
+if [[ ! "$SYNC_BUSY_EXIT_CODE" =~ ^[0-9]+$ ]]; then
+    SYNC_BUSY_EXIT_CODE=0
+fi
 REDACTION_HELPER="${REDACTION_HELPER:-$SCRIPT_DIR/redact-secrets.py}"
 if [ ! -f "$REDACTION_HELPER" ] && [ -f "$PWD/scripts/redact-secrets.py" ]; then
     REDACTION_HELPER="$PWD/scripts/redact-secrets.py"
@@ -778,24 +783,57 @@ mkdir -p "$OBSIDIAN_DIR"
 
 if ! acquire_lock; then
     printf '%s: Could not acquire lock, another sync is running\n' "$(date)" >> "$SYNC_LOG"
-    exit 0
+    exit "$SYNC_BUSY_EXIT_CODE"
 fi
 
 if [ ! -d "$CODEX_SESSIONS_DIR" ]; then
     printf '%s: Codex sessions directory not found: %s\n' "$(date)" "$CODEX_SESSIONS_DIR" >> "$SYNC_LOG"
+    if [ -n "$TARGET_JSONL" ]; then
+        exit 1
+    fi
     exit 0
 fi
 
 sync_fail=0
-while IFS= read -r -d '' jsonl_file; do
-    sync_session_file "$jsonl_file" || {
-        printf '%s: Failed to sync %s (continuing)\n' "$(date)" "$jsonl_file" >> "$SYNC_LOG"
-        sync_fail=$((sync_fail + 1))
+if [ -n "$TARGET_JSONL" ]; then
+    if [ -L "$TARGET_JSONL" ] || [ ! -f "$TARGET_JSONL" ]; then
+        printf '%s: Codex session file not found or is symlink: %s\n' "$(date)" "$TARGET_JSONL" >> "$SYNC_LOG"
+        exit 1
+    fi
+
+    if ! python3 - "$CODEX_SESSIONS_DIR" "$TARGET_JSONL" <<'PY'
+import os
+import sys
+
+sessions_dir = os.path.realpath(sys.argv[1])
+target = os.path.realpath(sys.argv[2])
+if target.startswith(sessions_dir + os.sep):
+    sys.exit(0)
+sys.exit(1)
+PY
+    then
+        printf '%s: Codex session file is outside CODEX_SESSIONS_DIR: %s\n' "$(date)" "$TARGET_JSONL" >> "$SYNC_LOG"
+        exit 1
+    fi
+
+    sync_session_file "$TARGET_JSONL" || {
+        printf '%s: Failed to sync %s\n' "$(date)" "$TARGET_JSONL" >> "$SYNC_LOG"
+        sync_fail=1
     }
-done < <(find "$CODEX_SESSIONS_DIR" -name "rollout-*.jsonl" -type f -print0)
+else
+    while IFS= read -r -d '' jsonl_file; do
+        sync_session_file "$jsonl_file" || {
+            printf '%s: Failed to sync %s (continuing)\n' "$(date)" "$jsonl_file" >> "$SYNC_LOG"
+            sync_fail=$((sync_fail + 1))
+        }
+    done < <(find "$CODEX_SESSIONS_DIR" -name "rollout-*.jsonl" -type f -print0)
+fi
 
 if [ "$sync_fail" -gt 0 ]; then
     printf '%s: Codex sync completed with %d failures\n' "$(date)" "$sync_fail" >> "$SYNC_LOG"
+    if [ -n "$TARGET_JSONL" ]; then
+        exit 1
+    fi
 else
     printf '%s: Codex sync completed\n' "$(date)" >> "$SYNC_LOG"
 fi

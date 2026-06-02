@@ -24,7 +24,7 @@ Markdown の保存先ディレクトリを `SECOND_BRAIN_DIR` に指定する。
 export SECOND_BRAIN_DIR="$HOME/path/to/your/notes"
 ```
 
-### 3. Claude Code の Stop フックに登録
+### 3. Claude Code の Stop フックに軽量 checkpoint を登録
 
 `~/.claude/settings.json` の `hooks.Stop` に以下を追加:
 
@@ -34,24 +34,76 @@ export SECOND_BRAIN_DIR="$HOME/path/to/your/notes"
     "Stop": [
       {
         "type": "command",
-        "command": "~/ai-second-brain/scripts/sync-recall-to-obsidian.sh \"$SESSION_ID\""
+        "command": "~/ai-second-brain/scripts/record-ai-session-checkpoint.sh --source claude --session-id \"$SESSION_ID\""
       }
     ]
   }
 }
 ```
 
-または既存の Stop フックスクリプトから呼び出す:
+Stop hook は会話終了の確定ではなく、アシスタント返答の終了で呼ばれる。そのためここでは同期を実行せず、`~/.claude/ai-second-brain-state/` に「この session が更新された」という checkpoint だけを書く。
+
+既存の Stop フックスクリプトがある場合は、直接同期ではなく以下を呼び出す:
 
 ```bash
-~/ai-second-brain/scripts/sync-recall-to-obsidian.sh "$SESSION_ID" &>/dev/null &
-~/ai-second-brain/scripts/sync-codex-to-obsidian.sh &>/dev/null &
+~/ai-second-brain/scripts/record-ai-session-checkpoint.sh --source claude --session-id "$SESSION_ID" &>/dev/null
+```
+
+このコマンドは軽量なのでバックグラウンド化しない。`SESSION_ID` が空の場合は Claude hook の stdin JSON から `session_id` を読む。
+
+### 4. idle sync を登録
+
+idle sync は checkpoint を見て、最後の更新から一定時間たった session だけを同期する。デフォルトでは15分以上 idle の session を対象にする。
+
+手動実行:
+
+```bash
+~/ai-second-brain/scripts/sync-idle-ai-sessions.sh
+```
+
+macOS の `launchd` で10分ごとに実行する例:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ai-second-brain.idle-sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/YOU/ai-second-brain/scripts/sync-idle-ai-sessions.sh</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>600</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SECOND_BRAIN_DIR</key>
+    <string>/absolute/path/to/your/notes</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
+```
+
+古い設定から移行する場合は、Stop hook から `sync-recall-to-obsidian.sh` や `sync-codex-to-obsidian.sh` を直接呼ぶ行を消し、`record-ai-session-checkpoint.sh` に置き換える。
+
+明示的に今すぐ保存したい場合だけ、同期スクリプトを直接実行する:
+
+```bash
+~/ai-second-brain/scripts/sync-recall-to-obsidian.sh "$SESSION_ID"
+~/ai-second-brain/scripts/sync-codex-to-obsidian.sh "$CODEX_JSONL_FILE"
 ```
 
 ## スクリプト一覧
 
 | スクリプト | 用途 |
 |-----------|------|
+| `scripts/record-ai-session-checkpoint.sh` | Stop hook 用の軽量 checkpoint 記録 |
+| `scripts/sync-idle-ai-sessions.sh` | idle になった checkpoint → Markdown |
 | `scripts/sync-recall-to-obsidian.sh` | Claude Code 会話 → Markdown |
 | `scripts/sync-codex-to-obsidian.sh` | Codex セッション → Markdown |
 | `scripts/convert_to_obsidian.py` | ChatGPT エクスポート → Markdown |
@@ -63,6 +115,8 @@ export SECOND_BRAIN_DIR="$HOME/path/to/your/notes"
 |--------|------|-----------|------|
 | `SECOND_BRAIN_DIR` | Yes | — | Markdown 保存先ディレクトリ |
 | `CODEX_SESSIONS_DIR` | No | `~/.codex/sessions` | Codex JSONL の場所 |
+| `AI_SECOND_BRAIN_STATE_DIR` | No | `~/.claude/ai-second-brain-state` | checkpoint 状態ファイルの場所 |
+| `AI_IDLE_MIN_AGE_SECONDS` | No | `900` | idle sync 対象になるまでの秒数 |
 
 ## 依存コマンド
 
@@ -96,6 +150,7 @@ recall は必須。同期スクリプトは起動時にコマンドの存在を�
 cd ~/ai-second-brain
 bash tests/test-sync-recall.sh
 bash tests/test-redaction.sh
+bash tests/test-idle-sync.sh
 ```
 
 ## ライセンス

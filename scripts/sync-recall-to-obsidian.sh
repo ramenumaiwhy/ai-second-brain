@@ -1,6 +1,6 @@
 #!/bin/bash
 # recall → Obsidian 同期スクリプト (tested)
-# SessionEndフックとcronの両方から呼ばれる
+# 明示保存、idle sync、daily recovery から呼ばれる
 
 set -euo pipefail
 umask 077
@@ -23,6 +23,10 @@ OBSIDIAN_DIR="${SECOND_BRAIN_DIR:?'Error: SECOND_BRAIN_DIR is not set. Set it to
 STAGING_DIR="$HOME/.claude/dream-staging"
 SYNC_LOG="$HOME/.claude/recall-sync.log"
 LOCK_DIR="$HOME/.claude/recall-obsidian-sync.lock"
+SYNC_BUSY_EXIT_CODE="${SYNC_BUSY_EXIT_CODE:-0}"
+if [[ ! "$SYNC_BUSY_EXIT_CODE" =~ ^[0-9]+$ ]]; then
+    SYNC_BUSY_EXIT_CODE=0
+fi
 REDACTION_HELPER="${REDACTION_HELPER:-$SCRIPT_DIR/redact-secrets.py}"
 if [ ! -f "$REDACTION_HELPER" ] && [ -f "$PWD/scripts/redact-secrets.py" ]; then
     REDACTION_HELPER="$PWD/scripts/redact-secrets.py"
@@ -640,7 +644,7 @@ find "$STAGING_DIR" -maxdepth 1 -name '*.md' -mtime +14 -delete 2>/dev/null || t
 
 if ! acquire_lock; then
     echo "$(date): Could not acquire lock, another sync is running" >> "$SYNC_LOG"
-    exit 0
+    exit "$SYNC_BUSY_EXIT_CODE"
 fi
 
 if [ -n "$SESSION_ID" ]; then

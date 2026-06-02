@@ -1156,6 +1156,57 @@ if [ -n "${CODEX_MD:-}" ]; then
 fi
 
 echo ""
+echo "=== Codex sync single JSONL ==="
+
+export HOME="$TEST_DIR/codex-single-home"
+export SECOND_BRAIN_DIR="$TEST_DIR/codex-single-obsidian"
+export CODEX_SESSIONS_DIR="$TEST_DIR/codex-single-sessions"
+mkdir -p "$HOME/.claude" "$SECOND_BRAIN_DIR" "$CODEX_SESSIONS_DIR"
+
+cp "$REPO_DIR/tests/fixtures/codex-redaction-rollout.jsonl" "$CODEX_SESSIONS_DIR/manual-session.jsonl"
+
+IGNORED_SID="123e4567-e89b-12d3-a456-426614174111"
+cat > "$CODEX_SESSIONS_DIR/rollout-ignored.jsonl" <<EOF
+{"type":"session_meta","timestamp":"2026-06-02T00:00:00Z","payload":{"id":"$IGNORED_SID","timestamp":"2026-06-02T00:00:00Z"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"ignored full sync file"}]}}
+EOF
+
+bash "$REPO_DIR/scripts/sync-codex-to-obsidian.sh" "$CODEX_SESSIONS_DIR/manual-session.jsonl"
+
+SINGLE_CODEX_MD=$(find "$SECOND_BRAIN_DIR" -name '*.md' -type f | head -1)
+if [ -z "$SINGLE_CODEX_MD" ]; then
+    fail "codex single markdown was created"
+else
+    pass "codex single markdown was created"
+    assert_file_contains "codex single file uses target session" "$SINGLE_CODEX_MD" "session_id: \"123e4567-e89b-12d3-a456-426614174000\""
+    assert_file_not_contains "codex single masks api key" "$SINGLE_CODEX_MD" "fake-codex-api-key"
+fi
+
+IGNORED_MD=$(find "$SECOND_BRAIN_DIR" -name '*.md' -type f -print0 | xargs -0 grep -l "session_id: \"$IGNORED_SID\"" 2>/dev/null | head -1 || true)
+if [ -z "$IGNORED_MD" ]; then
+    pass "codex single file does not run full sync"
+else
+    fail "codex single file does not run full sync"
+fi
+
+MISSING_DIR_HOME="$TEST_DIR/codex-single-missing-home"
+MISSING_DIR_OBSIDIAN="$TEST_DIR/codex-single-missing-obsidian"
+MISSING_DIR="$TEST_DIR/codex-single-missing-sessions"
+MISSING_TARGET_JSONL="$CODEX_SESSIONS_DIR/manual-session.jsonl"
+mkdir -p "$MISSING_DIR_HOME/.claude" "$MISSING_DIR_OBSIDIAN"
+if HOME="$MISSING_DIR_HOME" SECOND_BRAIN_DIR="$MISSING_DIR_OBSIDIAN" CODEX_SESSIONS_DIR="$MISSING_DIR" \
+    bash "$REPO_DIR/scripts/sync-codex-to-obsidian.sh" "$MISSING_TARGET_JSONL" >/dev/null 2>&1; then
+    fail "codex single sync fails when sessions dir is missing"
+else
+    pass "codex single sync fails when sessions dir is missing"
+fi
+if [ "$(find "$MISSING_DIR_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')" = "0" ]; then
+    pass "codex missing sessions dir writes no markdown"
+else
+    fail "codex missing sessions dir writes no markdown"
+fi
+
+echo ""
 echo "=== Codex legacy Transcript heading ==="
 
 export HOME="$TEST_DIR/codex-legacy-home"
