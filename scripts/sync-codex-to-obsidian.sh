@@ -34,6 +34,10 @@ REDACTION_HELPER="${REDACTION_HELPER:-$SCRIPT_DIR/redact-secrets.py}"
 if [ ! -f "$REDACTION_HELPER" ] && [ -f "$PWD/scripts/redact-secrets.py" ]; then
     REDACTION_HELPER="$PWD/scripts/redact-secrets.py"
 fi
+AI_LOG_WRITER="${AI_LOG_WRITER:-$SCRIPT_DIR/ai-log-writer.py}"
+if [ ! -f "$AI_LOG_WRITER" ] && [ -f "$PWD/scripts/ai-log-writer.py" ]; then
+    AI_LOG_WRITER="$PWD/scripts/ai-log-writer.py"
+fi
 
 # 親ディレクトリの存在を保証
 mkdir -p "$HOME/.claude"
@@ -121,6 +125,14 @@ redact_stream() {
 
 redact_value() {
     printf '%s' "$1" | redact_stream
+}
+
+ai_log_writer() {
+    if [ ! -f "$AI_LOG_WRITER" ]; then
+        printf '%s: AI log writer not found: %s\n' "$(date)" "$AI_LOG_WRITER" >> "$SYNC_LOG"
+        return 1
+    fi
+    REDACTION_HELPER="$REDACTION_HELPER" python3 "$AI_LOG_WRITER" "$@"
 }
 
 # UUID形式のみ許可（8-4-4-4-12 のハイフン区切りhex、棄却方式）
@@ -343,6 +355,39 @@ except (OSError, UnicodeDecodeError):
 " "$filepath"
 }
 
+is_shared_ai_log_record() {
+    local filepath="$1"
+    python3 -c "
+import sys
+
+required = {'msg_count', 'last_message_hash', 'transcript_hash'}
+
+try:
+    lines = open(sys.argv[1], 'r', encoding='utf-8', errors='replace').read().splitlines()
+except (OSError, UnicodeDecodeError):
+    sys.exit(1)
+
+if not lines or lines[0] != '---':
+    sys.exit(1)
+
+frontmatter_keys = set()
+frontmatter_end = None
+for idx, line in enumerate(lines[1:], start=1):
+    if line == '---':
+        frontmatter_end = idx
+        break
+    if ':' in line:
+        frontmatter_keys.add(line.split(':', 1)[0].strip())
+
+if frontmatter_end is None or not required.issubset(frontmatter_keys):
+    sys.exit(1)
+
+if any(line.strip() == '## Transcript' for line in lines[frontmatter_end + 1:]):
+    sys.exit(0)
+sys.exit(1)
+" "$filepath"
+}
+
 # メッセージJSONを展開してMarkdownテキストを生成（一括処理）
 format_messages_as_markdown() {
     local messages_json="$1"
@@ -451,6 +496,26 @@ sync_session_file() {
         fi
 
         if [ "$msg_count" -le "$existing_msg_count" ]; then
+            return 0
+        fi
+
+        if is_shared_ai_log_record "$existing_file"; then
+            tmp_file=$(mktemp "$OBSIDIAN_DIR/.tmp_update.XXXXXX") || return 1
+            if ! printf '%s' "$messages_json" | ai_log_writer append --existing-file "$existing_file" > "$tmp_file"; then
+                printf '%s: Shared append failed for %s\n' "$(date)" "$existing_file" >> "$SYNC_LOG"
+                return 1
+            fi
+            if cmp -s "$existing_file" "$tmp_file"; then
+                rm -f "$tmp_file" 2>/dev/null || true
+                tmp_file=""
+                return 0
+            fi
+            if ! mv -f "$tmp_file" "$existing_file"; then
+                printf '%s: Failed to move updated file for %s\n' "$(date)" "$existing_file" >> "$SYNC_LOG"
+                return 1
+            fi
+            tmp_file=""
+            printf '%s: Appended to %s (%s -> %s)\n' "$(date)" "$existing_file" "$existing_msg_count" "$msg_count" >> "$SYNC_LOG"
             return 0
         fi
 
@@ -640,33 +705,24 @@ print('untitled')
     local filename="${date_str}_${safe_title}_${short_sid}.md"
     local filepath="$OBSIDIAN_DIR/$filename"
 
-    local escaped_title
-    escaped_title=$(yaml_escape "$title")
+    local record_kind
+    record_kind="${RECORD_KIND:-interactive}"
 
     tmp_file=$(mktemp "$OBSIDIAN_DIR/.tmp.XXXXXX") || {
         printf '%s: Failed to create temp file for session %s\n' "$(date)" "$sid" >> "$SYNC_LOG"
         return 1
     }
 
-    {
-        printf '%s\n' "---"
-        printf 'date: %s\n' "$date_str"
-        printf 'title: "%s"\n' "$escaped_title"
-        printf '%s\n' "source: Codex"
-        printf 'session_id: %s\n' "$sid"
-        printf 'msg_count: %s\n' "$msg_count"
-        printf '%s\n' "tags:"
-        printf '%s\n' "  - codex"
-        printf '%s\n' "---"
-        printf '\n'
-        printf '# %s\n' "$(printf '%s' "$title" | tr -d '\n\r')"
-        printf '\n'
-
-        format_messages_as_markdown "$messages_json" 0 0 0
-    } > "$tmp_file" || {
+    if ! printf '%s' "$messages_json" | ai_log_writer create \
+        --date="$date_str" \
+        --title="$title" \
+        --source="Codex" \
+        --session-id="$sid" \
+        --record-kind="$record_kind" \
+        --tag="codex" > "$tmp_file"; then
         printf '%s: Failed to write temp file for session %s\n' "$(date)" "$sid" >> "$SYNC_LOG"
         return 1
-    }
+    fi
 
     # fsync でファイル + 親ディレクトリの永続化保証
     python3 -c "

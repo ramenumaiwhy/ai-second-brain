@@ -27,6 +27,10 @@ REDACTION_HELPER="${REDACTION_HELPER:-$SCRIPT_DIR/redact-secrets.py}"
 if [ ! -f "$REDACTION_HELPER" ] && [ -f "$PWD/scripts/redact-secrets.py" ]; then
     REDACTION_HELPER="$PWD/scripts/redact-secrets.py"
 fi
+AI_LOG_WRITER="${AI_LOG_WRITER:-$SCRIPT_DIR/ai-log-writer.py}"
+if [ ! -f "$AI_LOG_WRITER" ] && [ -f "$PWD/scripts/ai-log-writer.py" ]; then
+    AI_LOG_WRITER="$PWD/scripts/ai-log-writer.py"
+fi
 
 mkdir -p "$HOME/.claude"
 
@@ -172,6 +176,72 @@ yaml_escape() {
         printf '%s' "$str" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '
 }
 
+get_frontmatter_msg_count() {
+    local filepath="$1"
+    python3 -c "
+import sys
+
+try:
+    count = None
+    in_fm = False
+    has_frontmatter = False
+    fm_closed = False
+    for line in open(sys.argv[1], 'r', encoding='utf-8', errors='replace'):
+        line = line.rstrip('\n')
+        if line == '---':
+            if not in_fm:
+                in_fm = True
+                has_frontmatter = True
+                continue
+            fm_closed = True
+            break
+        if in_fm and line.startswith('msg_count: '):
+            try:
+                count = int(line.split(': ', 1)[1])
+            except ValueError:
+                pass
+    if not has_frontmatter or not fm_closed or count is None:
+        print(-1)
+    else:
+        print(count)
+except (OSError, UnicodeDecodeError):
+    print(-1)
+" "$filepath"
+}
+
+is_shared_ai_log_record() {
+    local filepath="$1"
+    python3 -c "
+import sys
+
+required = {'msg_count', 'last_message_hash', 'transcript_hash'}
+
+try:
+    lines = open(sys.argv[1], 'r', encoding='utf-8', errors='replace').read().splitlines()
+except (OSError, UnicodeDecodeError):
+    sys.exit(1)
+
+if not lines or lines[0] != '---':
+    sys.exit(1)
+
+frontmatter_keys = set()
+frontmatter_end = None
+for idx, line in enumerate(lines[1:], start=1):
+    if line == '---':
+        frontmatter_end = idx
+        break
+    if ':' in line:
+        frontmatter_keys.add(line.split(':', 1)[0].strip())
+
+if frontmatter_end is None or not required.issubset(frontmatter_keys):
+    sys.exit(1)
+
+if any(line.strip() == '## Transcript' for line in lines[frontmatter_end + 1:]):
+    sys.exit(0)
+sys.exit(1)
+" "$filepath"
+}
+
 redact_stream() {
     if [ ! -f "$REDACTION_HELPER" ]; then
         echo "$(date): Redaction helper not found: $REDACTION_HELPER" >> "$SYNC_LOG"
@@ -182,6 +252,14 @@ redact_stream() {
 
 redact_value() {
     printf '%s' "$1" | redact_stream
+}
+
+ai_log_writer() {
+    if [ ! -f "$AI_LOG_WRITER" ]; then
+        echo "$(date): AI log writer not found: $AI_LOG_WRITER" >> "$SYNC_LOG"
+        return 1
+    fi
+    REDACTION_HELPER="$REDACTION_HELPER" python3 "$AI_LOG_WRITER" "$@"
 }
 
 format_recall_messages_as_markdown() {
@@ -306,6 +384,38 @@ sync_session() {
 
     # 既存ファイルがある場合 → 差分追記
     if [ -n "$existing_file" ]; then
+        if is_shared_ai_log_record "$existing_file"; then
+            local existing_msg_count
+            existing_msg_count=$(get_frontmatter_msg_count "$existing_file")
+            if [ "$existing_msg_count" -eq -1 ]; then
+                echo "$(date): Skipping $existing_file (missing/invalid msg_count in frontmatter)" >> "$SYNC_LOG"
+                return 0
+            fi
+            if [ "$msg_count" -le "$existing_msg_count" ]; then
+                return 0
+            fi
+
+            local tmp_shared
+            tmp_shared=$(mktemp "$OBSIDIAN_DIR/.tmp.XXXXXX") || {
+                echo "$(date): Failed to create temp file for shared append" >> "$SYNC_LOG"
+                return 1
+            }
+            if ! printf '%s' "$json" | ai_log_writer append --existing-file "$existing_file" > "$tmp_shared"; then
+                rm -f "$tmp_shared" 2>/dev/null || true
+                echo "$(date): Shared append failed for $existing_file" >> "$SYNC_LOG"
+                return 1
+            fi
+            if cmp -s "$existing_file" "$tmp_shared"; then
+                rm -f "$tmp_shared" 2>/dev/null || true
+                return 0
+            fi
+            mv -f "$tmp_shared" "$existing_file"
+            echo "$(date): Appended to $existing_file ($existing_msg_count -> $msg_count messages)" >> "$SYNC_LOG"
+            mkdir -p "$STAGING_DIR"
+            cp -f "$existing_file" "$STAGING_DIR/$(basename "$existing_file")" 2>/dev/null || true
+            return 0
+        fi
+
         # 既存ファイルの Q/A 数をカウント（## Q* と ## A* の行数）
         local existing_qa_count
         existing_qa_count=$(grep -cE '^## [QA][0-9]+' "$existing_file" 2>/dev/null) || true
@@ -479,10 +589,6 @@ print(safe)
         esac
     fi
 
-    # YAMLエスケープしたタイトル
-    local escaped_title
-    escaped_title=$(yaml_escape "$title")
-
     # 一時ファイルに書き出してからアトミックにmv（同一FS内で作成）
     local tmp_file
     tmp_file=$(mktemp "$OBSIDIAN_DIR/.tmp.XXXXXX") || {
@@ -493,36 +599,16 @@ print(safe)
     # エラー時に一時ファイルを確実にクリーンアップ
     trap 'rm -f "$tmp_file" 2>/dev/null' RETURN
 
-    # sourceをYAMLエスケープ
-    local escaped_source
-    escaped_source=$(yaml_escape "$source")
-
-    {
-        # #2: source_name/sidもYAMLエスケープ（インジェクション防止）
-        local escaped_source_name
-        escaped_source_name=$(yaml_escape "$source_name")
-        local escaped_sid
-        escaped_sid=$(yaml_escape "$sid")
-        echo "---"
-        echo "date: $date_str"
-        echo "title: \"$escaped_title\""
-        echo "source: \"$escaped_source_name\""
-        echo "session_id: \"$escaped_sid\""
-        local escaped_record_kind
-        escaped_record_kind=$(yaml_escape "$record_kind")
-        echo "record_kind: \"$escaped_record_kind\""
-        echo "tags:"
-        echo "  - \"$escaped_source\""
-        echo "---"
-        echo ""
-        printf '# %s\n' "$(printf '%s' "$title" | tr -d '\n\r')"
-        echo ""
-
-        format_recall_messages_as_markdown "$json" 0 0 0
-    } > "$tmp_file" || {
+    if ! printf '%s' "$json" | ai_log_writer create \
+        --date="$date_str" \
+        --title="$title" \
+        --source="$source_name" \
+        --session-id="$sid" \
+        --record-kind="$record_kind" \
+        --tag="$source" > "$tmp_file"; then
         echo "$(date): Failed to write temp file for session $sid" >> "$SYNC_LOG"
         return 1
-    }
+    fi
 
     # アトミックに移動
     mv "$tmp_file" "$filepath" || {
