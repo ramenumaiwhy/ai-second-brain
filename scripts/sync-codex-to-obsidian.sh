@@ -120,7 +120,7 @@ redact_stream() {
         printf '%s: Redaction helper not found: %s\n' "$(date)" "$REDACTION_HELPER" >> "$SYNC_LOG"
         return 1
     fi
-    python3 "$REDACTION_HELPER"
+    REDACTION_AUDIT_LOG="$SYNC_LOG" python3 "$REDACTION_HELPER"
 }
 
 redact_value() {
@@ -132,7 +132,7 @@ ai_log_writer() {
         printf '%s: AI log writer not found: %s\n' "$(date)" "$AI_LOG_WRITER" >> "$SYNC_LOG"
         return 1
     fi
-    REDACTION_HELPER="$REDACTION_HELPER" python3 "$AI_LOG_WRITER" "$@"
+    REDACTION_AUDIT_LOG="$SYNC_LOG" REDACTION_HELPER="$REDACTION_HELPER" python3 "$AI_LOG_WRITER" "$@"
 }
 
 # UUID形式のみ許可（8-4-4-4-12 のハイフン区切りhex、棄却方式）

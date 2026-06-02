@@ -247,7 +247,7 @@ redact_stream() {
         echo "$(date): Redaction helper not found: $REDACTION_HELPER" >> "$SYNC_LOG"
         return 1
     fi
-    python3 "$REDACTION_HELPER"
+    REDACTION_AUDIT_LOG="$SYNC_LOG" python3 "$REDACTION_HELPER"
 }
 
 redact_value() {
@@ -259,7 +259,7 @@ ai_log_writer() {
         echo "$(date): AI log writer not found: $AI_LOG_WRITER" >> "$SYNC_LOG"
         return 1
     fi
-    REDACTION_HELPER="$REDACTION_HELPER" python3 "$AI_LOG_WRITER" "$@"
+    REDACTION_AUDIT_LOG="$SYNC_LOG" REDACTION_HELPER="$REDACTION_HELPER" python3 "$AI_LOG_WRITER" "$@"
 }
 
 format_recall_messages_as_markdown() {

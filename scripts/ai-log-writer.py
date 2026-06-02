@@ -316,13 +316,30 @@ def append_record(args: argparse.Namespace) -> int:
         source_prefix_transcript, source_prefix_entries = format_entries(messages[:existing_count])
         source_prefix_metadata = transcript_metadata(source_prefix_transcript, source_prefix_entries)
         expected_last_hash = frontmatter.get("last_message_hash", "")
-        if expected_last_hash and expected_last_hash != source_prefix_metadata["last_message_hash"]:
-            print("last_message_hash does not match source prefix", file=sys.stderr)
-            return 2
-        if expected_hash and expected_hash != source_prefix_metadata["transcript_hash"]:
-            print("transcript_hash does not match source prefix", file=sys.stderr)
-            return 2
+        prefix_matches = (
+            (not expected_last_hash or expected_last_hash == source_prefix_metadata["last_message_hash"])
+            and (not expected_hash or expected_hash == source_prefix_metadata["transcript_hash"])
+        )
+        if not prefix_matches:
+            redacted_existing_transcript = normalize_transcript(redact_text(existing_transcript))
+            redacted_existing_entries = parse_transcript_entries(redacted_existing_transcript)
+            redacted_metadata = transcript_metadata(redacted_existing_transcript, redacted_existing_entries)
+            redacted_prefix_matches = (
+                len(redacted_existing_entries) == existing_count
+                and redacted_metadata["last_message_hash"] == source_prefix_metadata["last_message_hash"]
+                and redacted_metadata["transcript_hash"] == source_prefix_metadata["transcript_hash"]
+            )
+            if redacted_prefix_matches:
+                existing_transcript = redacted_existing_transcript
+                existing_entries = redacted_existing_entries
+            elif expected_last_hash and expected_last_hash != source_prefix_metadata["last_message_hash"]:
+                print("last_message_hash does not match source prefix", file=sys.stderr)
+                return 2
+            elif expected_hash and expected_hash != source_prefix_metadata["transcript_hash"]:
+                print("transcript_hash does not match source prefix", file=sys.stderr)
+                return 2
 
+    prefix = redact_text(prefix)
     user_count, assistant_count = transcript_counts(existing_transcript)
     appended_transcript, appended_entries = format_entries(
         messages,

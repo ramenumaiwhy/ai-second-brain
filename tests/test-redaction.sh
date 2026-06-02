@@ -67,21 +67,63 @@ private_key_block=$(printf '%s\n%s\n%s' \
     "-----BEGIN PRIVATE KEY-----" \
     "abc123" \
     "-----END PRIVATE KEY-----")
-helper_input=$(cat <<EOF
+stripe_key="rk_li""ve_helperStripeToken000000000000"
+helper_input=$(cat <<'EOF'
 Authorization: Bearer helperBearerToken0000000000000000000000
 OPENAI_API_KEY=fake-helper-api-key
 client_secret: "helper-client-secret"
-$private_key_block
+ANTHROPIC_API_KEY=sk-ant-api03-helperAnthropicToken0000000000000000
+GOOGLE_API_KEY=AIzaHelperGoogleToken000000000000000000000
+HF_TOKEN=hf_helperHuggingFaceToken000000000
+MULTILINE_SECRET="helper multiline first
+helper multiline second
+helper multiline third"
+ESCAPED_MULTILINE_SECRET="escaped quote \" stays secret
+secret tail after escaped quote
+escaped multiline close"
+COMMENTED_MULTILINE_SECRET="helper comment first
+helper comment second" # keep comment
+JSON_MULTILINE_SECRET: "helper json first
+helper json second",
+SHELL_MULTILINE_SECRET="helper shell first
+helper shell second";
+JSON_COMMENT_MULTILINE_SECRET: "helper json comment first
+helper json comment second", # keep comment
+JSON_BRACE_MULTILINE_SECRET: "helper json brace first
+helper json brace second" }
+```env
+NPM_TOKEN=fake-helper-npm-token
+```
 Normal line stays visible.
 EOF
 )
-helper_output=$(printf '%s' "$helper_input" | python3 "$REDACTION_HELPER")
+helper_input="${helper_input}"$'\n'"STRIPE_SECRET_KEY=${stripe_key}"$'\n'"$private_key_block"$'\nUNCLOSED_SECRET="helper unterminated secret\nNormal line after unterminated secret remains.\nQUOTE_NORMAL_SECRET="helper quote normal\nNormal "quoted" text after unterminated secret remains.'
+HELPER_AUDIT_LOG="$TEST_DIR/helper-audit.log"
+helper_output=$(printf '%s' "$helper_input" | REDACTION_AUDIT_LOG="$HELPER_AUDIT_LOG" python3 "$REDACTION_HELPER")
 
 assert_text_not_contains "helper masks bearer value" "$helper_output" "helperBearerToken0000000000000000000000"
 assert_text_not_contains "helper masks api key value" "$helper_output" "fake-helper-api-key"
 assert_text_not_contains "helper masks colon secret value" "$helper_output" "helper-client-secret"
+assert_text_not_contains "helper masks anthropic key" "$helper_output" "helperAnthropicToken0000000000000000"
+assert_text_not_contains "helper masks google key" "$helper_output" "HelperGoogleToken000000000000000000000"
+assert_text_not_contains "helper masks stripe key" "$helper_output" "helperStripeToken000000000000"
+assert_text_not_contains "helper masks huggingface token" "$helper_output" "helperHuggingFaceToken000000000"
+assert_text_not_contains "helper masks multiline secret continuation" "$helper_output" "helper multiline second"
+assert_text_not_contains "helper ignores escaped multiline quote" "$helper_output" "secret tail after escaped quote"
+assert_text_not_contains "helper masks commented multiline secret continuation" "$helper_output" "helper comment second"
+assert_text_not_contains "helper masks comma multiline secret continuation" "$helper_output" "helper json second"
+assert_text_not_contains "helper masks semicolon multiline secret continuation" "$helper_output" "helper shell second"
+assert_text_not_contains "helper masks comma-comment multiline secret continuation" "$helper_output" "helper json comment second"
+assert_text_not_contains "helper masks brace multiline secret continuation" "$helper_output" "helper json brace second"
+assert_text_not_contains "helper masks unterminated secret line" "$helper_output" "helper unterminated secret"
+assert_text_contains "helper preserves text after unterminated secret" "$helper_output" "Normal line after unterminated secret remains."
+assert_text_not_contains "helper masks unterminated quote secret line" "$helper_output" "helper quote normal"
+assert_text_contains "helper preserves quoted normal text after unterminated secret" "$helper_output" "Normal \"quoted\" text after unterminated secret remains."
+assert_text_not_contains "helper masks fenced env secret" "$helper_output" "fake-helper-npm-token"
 assert_text_not_contains "helper masks private key body" "$helper_output" "abc123"
 assert_text_contains "helper keeps non-secret text" "$helper_output" "Normal line stays visible."
+assert_file_contains "helper writes redaction audit" "$HELPER_AUDIT_LOG" "redacted"
+assert_file_not_contains "helper audit omits secret value" "$HELPER_AUDIT_LOG" "fake-helper-api-key"
 
 echo ""
 echo "=== Shared writer boundaries ==="
@@ -186,6 +228,37 @@ assert_file_contains "writer ignores Summary Transcript heading" "$SUMMARY_WRITE
 assert_file_contains "writer appends after canonical Transcript" "$SUMMARY_WRITER_MD" "### Assistant 1"
 assert_file_contains "writer preserves msg_count with duplicate heading" "$SUMMARY_WRITER_MD" "msg_count: 2"
 
+LEGACY_REDACTOR="$TEST_DIR/legacy-redact.py"
+cat > "$LEGACY_REDACTOR" <<'PY'
+def redact_text(text):
+    return text
+PY
+
+LEGACY_REDACTION_MD="$TEST_DIR/writer-legacy-redaction.md"
+cat <<'EOF' | REDACTION_HELPER="$LEGACY_REDACTOR" python3 "$AI_LOG_WRITER" create \
+    --date "2026-06-02" \
+    --title "raw key AIzaHelperGoogleToken000000000000000000000" \
+    --source "Codex" \
+    --session-id "writer-legacy-redaction" \
+    --record-kind "interactive" \
+    --tag "codex" > "$LEGACY_REDACTION_MD"
+[
+  {"role": "user", "text": "raw key AIzaHelperGoogleToken000000000000000000000"}
+]
+EOF
+
+cat <<'EOF' | REDACTION_HELPER="$REDACTION_HELPER" python3 "$AI_LOG_WRITER" append --existing-file "$LEGACY_REDACTION_MD" > "$TEST_DIR/writer-legacy-redaction-updated.md"
+[
+  {"role": "user", "text": "raw key AIzaHelperGoogleToken000000000000000000000"},
+  {"role": "assistant", "text": "later"}
+]
+EOF
+mv "$TEST_DIR/writer-legacy-redaction-updated.md" "$LEGACY_REDACTION_MD"
+
+assert_file_not_contains "writer migrates old unredacted prefix" "$LEGACY_REDACTION_MD" "AIzaHelperGoogleToken000000000000000000000"
+assert_file_contains "writer appends after redaction migration" "$LEGACY_REDACTION_MD" "### Assistant 1"
+assert_file_contains "writer updates migrated msg_count" "$LEGACY_REDACTION_MD" "msg_count: 2"
+
 rm -rf "$REPO_DIR/scripts/__pycache__"
 printf '[]' | python3 "$AI_LOG_WRITER" create \
     --date "2026-06-02" \
@@ -248,6 +321,8 @@ if [ -n "${CLAUDE_MD:-}" ]; then
     assert_file_not_contains "claude append masks bot token" "$CLAUDE_MD" "fake-telegram-bot-token"
     assert_file_not_contains "claude append masks github token" "$CLAUDE_MD" "fake-claude-github-token"
     assert_file_contains "claude append keeps normal appended text" "$CLAUDE_MD" "Append this token too"
+    assert_file_contains "claude logs redaction audit" "$HOME/.claude/recall-sync.log" "redacted"
+    assert_file_not_contains "claude sync log omits api key" "$HOME/.claude/recall-sync.log" "fake-claude-api-key"
 fi
 
 echo ""
@@ -285,6 +360,8 @@ if [ -n "${CODEX_MD:-}" ]; then
     assert_file_not_contains "codex append masks github token" "$CODEX_MD" "fake-codex-github-token"
     assert_file_contains "codex updates msg_count on append" "$CODEX_MD" "msg_count: 4"
     assert_file_contains "codex append keeps normal text" "$CODEX_MD" "keep normal text"
+    assert_file_contains "codex logs redaction audit" "$HOME/.claude/codex-sync.log" "redacted"
+    assert_file_not_contains "codex sync log omits api key" "$HOME/.claude/codex-sync.log" "fake-codex-api-key"
 fi
 
 echo ""
