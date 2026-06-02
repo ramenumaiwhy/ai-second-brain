@@ -98,12 +98,25 @@ macOS の `launchd` で10分ごとに実行する例:
 ~/ai-second-brain/scripts/sync-codex-to-obsidian.sh "$CODEX_JSONL_FILE"
 ```
 
+### 5. daily recovery を登録
+
+daily recovery は Stop hook や idle sync が取りこぼした session を、最近更新されたローカルログから回収する。デフォルトでは直近3日、最大50件だけを見る。
+
+手動実行:
+
+```bash
+~/ai-second-brain/scripts/recover-ai-sessions-daily.sh
+```
+
+`launchd` では1日1回の実行にする。daily recovery は候補を絞って既存の同期スクリプトへ渡すだけなので、既に最新のMarkdownは `msg_count` 判定でスキップされる。上限で古い候補が取り残されないよう、state file に最近試した候補を保存して次回は未処理候補を優先する。
+
 ## スクリプト一覧
 
 | スクリプト | 用途 |
 |-----------|------|
 | `scripts/record-ai-session-checkpoint.sh` | Stop hook 用の軽量 checkpoint 記録 |
 | `scripts/sync-idle-ai-sessions.sh` | idle になった checkpoint → Markdown |
+| `scripts/recover-ai-sessions-daily.sh` | 最近更新された session の日次回収 |
 | `scripts/sync-recall-to-obsidian.sh` | Claude Code 会話 → Markdown |
 | `scripts/sync-codex-to-obsidian.sh` | Codex セッション → Markdown |
 | `scripts/convert_to_obsidian.py` | ChatGPT エクスポート → Markdown |
@@ -117,6 +130,9 @@ macOS の `launchd` で10分ごとに実行する例:
 | `CODEX_SESSIONS_DIR` | No | `~/.codex/sessions` | Codex JSONL の場所 |
 | `AI_SECOND_BRAIN_STATE_DIR` | No | `~/.claude/ai-second-brain-state` | checkpoint 状態ファイルの場所 |
 | `AI_IDLE_MIN_AGE_SECONDS` | No | `900` | idle sync 対象になるまでの秒数 |
+| `AI_RECOVERY_LOOKBACK_DAYS` | No | `3` | daily recovery が見る過去日数 |
+| `AI_RECOVERY_MAX_SESSIONS` | No | `50` | daily recovery 1回あたりの最大候補数 |
+| `CLAUDE_PROJECTS_DIR` | No | `~/.claude/projects` | Claude Code JSONL fallback の場所 |
 
 ## 依存コマンド
 
@@ -151,6 +167,7 @@ cd ~/ai-second-brain
 bash tests/test-sync-recall.sh
 bash tests/test-redaction.sh
 bash tests/test-idle-sync.sh
+bash tests/test-daily-recovery.sh
 ```
 
 ## ライセンス

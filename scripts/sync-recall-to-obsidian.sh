@@ -44,13 +44,20 @@ SESSION_ID="${1:-}"
 # recall read が失敗した場合にJSONLファイルから直接読む（フォークセッション対応）
 read_from_jsonl() {
     local sid="$1"
-    local jsonl_dir="$HOME/.claude/projects"
+    local jsonl_dir="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 
     # セッションIDに対応するJSONLファイルを探す（claude/codex両方を探索）
     local jsonl_file=""
-    local find_paths=("$jsonl_dir")
-    [ -d "$HOME/.codex/sessions" ] && find_paths+=("$HOME/.codex/sessions")
-    jsonl_file=$(find "${find_paths[@]}" -name "${sid}.jsonl" -type f 2>/dev/null | head -1) || true
+    if [ -n "${CLAUDE_SESSION_JSONL_PATH:-}" ]; then
+        if [ -L "$CLAUDE_SESSION_JSONL_PATH" ] || [ ! -f "$CLAUDE_SESSION_JSONL_PATH" ]; then
+            return 1
+        fi
+        jsonl_file="$CLAUDE_SESSION_JSONL_PATH"
+    else
+        local find_paths=("$jsonl_dir")
+        [ -d "$HOME/.codex/sessions" ] && find_paths+=("$HOME/.codex/sessions")
+        jsonl_file=$(find "${find_paths[@]}" -name "${sid}.jsonl" -type f 2>/dev/null | head -1) || true
+    fi
 
     if [ -z "$jsonl_file" ]; then
         return 1
@@ -59,10 +66,15 @@ read_from_jsonl() {
     # JSONLからrecall read互換のJSON構造を生成
     python3 -c "
 import json
+import os
 import sys
 
 sid = sys.argv[1]
 jsonl_path = sys.argv[2]
+allow_missing_sid = (
+    os.path.basename(jsonl_path) == f'{sid}.jsonl'
+    or os.environ.get('CLAUDE_SESSION_JSONL_PATH') == jsonl_path
+)
 
 messages = []
 first_timestamp = None
@@ -78,10 +90,12 @@ with open(jsonl_path, 'r', encoding='utf-8', errors='replace') as f:
             continue
 
         rec_type = record.get('type', '')
-        rec_sid = record.get('sessionId', '')
+        rec_sid = record.get('sessionId') or record.get('session_id') or ''
 
         # このセッションIDのuser/assistantメッセージだけ抽出
-        if rec_sid != sid:
+        if rec_sid and rec_sid != sid:
+            continue
+        if not rec_sid and not allow_missing_sid:
             continue
         if rec_type not in ('user', 'assistant'):
             continue
@@ -136,6 +150,33 @@ result = {
 
 print(json.dumps(result, ensure_ascii=False))
 " "$sid" "$jsonl_file" 2>/dev/null
+}
+
+persisted_session_id() {
+    local sid="$1"
+    local jsonl_path="${2:-}"
+
+    if [ -z "$jsonl_path" ]; then
+        printf '%s' "$sid"
+        return 0
+    fi
+
+    python3 - "$sid" "$jsonl_path" <<'PY'
+import hashlib
+import os
+import re
+import sys
+
+sid = sys.argv[1]
+path = sys.argv[2]
+if os.environ.get("CLAUDE_SESSION_IDENTITY_MODE") != "path":
+    print(sid)
+    sys.exit(0)
+
+digest = hashlib.sha256(os.path.realpath(path).encode("utf-8")).hexdigest()[:16]
+safe_sid = re.sub(r"[^A-Za-z0-9_.:-]+", "-", sid).strip("-") or "session"
+print(f"{digest}-{safe_sid}")
+PY
 }
 
 # 排他ロック取得（TOCTOU脆弱性を最小化）
@@ -303,39 +344,50 @@ for m in msgs:
 sync_session() {
     local sid="$1"
     local json
+    local persisted_sid="$sid"
 
-    # recall readはフォークセッション等で正常にexit 1を返すため、|| trueで受けてフォールバックへ進む
-    json=$(recall read "$sid" 2>/dev/null) || true
-
-    # #3: 非空だが不正JSONの場合もフォールバックへ回す
-    if [ -n "$json" ] && ! printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
-        echo "$(date): Invalid JSON from recall for session $sid, trying fallback" >> "$SYNC_LOG"
-        json=""
-    fi
-
-    if [ -z "$json" ]; then
-        # recall CLIで読めない場合、JSONLファイルから直接読む（フォークセッション対応）
-        # read_from_jsonlはファイル未発見で正常にexit 1を返すため、|| trueで受ける
+    if [ -n "${CLAUDE_SESSION_JSONL_PATH:-}" ]; then
         json=$(read_from_jsonl "$sid") || true
         if [ -z "$json" ]; then
-            echo "$(date): Failed to read session $sid (recall + jsonl fallback)" >> "$SYNC_LOG"
+            echo "$(date): Failed to read requested JSONL for session $sid" >> "$SYNC_LOG"
             return 1
         fi
-        echo "$(date): Using JSONL fallback for session $sid (recall empty)" >> "$SYNC_LOG"
+        persisted_sid=$(persisted_session_id "$sid" "$CLAUDE_SESSION_JSONL_PATH") || return 1
+        echo "$(date): Using requested JSONL fallback for session $sid" >> "$SYNC_LOG"
     else
-        # recall read が返したメッセージ数とJSONLのメッセージ数を比較
-        # recall read が極端に少ない場合（JONLの半分未満）はJSONLフォールバックを使う
-        local recall_msg_count
-        recall_msg_count=$(printf '%s' "$json" | jq '(.messages // []) | length' 2>/dev/null) || recall_msg_count=0
-        local jsonl_json
-        jsonl_json=$(read_from_jsonl "$sid" 2>/dev/null) || true
-        if [ -n "$jsonl_json" ]; then
-            local jsonl_msg_count
-            jsonl_msg_count=$(printf '%s' "$jsonl_json" | jq '(.messages // []) | length' 2>/dev/null) || jsonl_msg_count=0
-            if [ "$jsonl_msg_count" -gt 0 ] && [ "$recall_msg_count" -gt 0 ] && \
-               [ "$jsonl_msg_count" -ge $((recall_msg_count * 2)) ]; then
-                echo "$(date): JSONL has significantly more messages ($jsonl_msg_count) than recall ($recall_msg_count) for session $sid, using JSONL" >> "$SYNC_LOG"
-                json="$jsonl_json"
+        # recall readはフォークセッション等で正常にexit 1を返すため、|| trueで受けてフォールバックへ進む
+        json=$(recall read "$sid" 2>/dev/null) || true
+
+        # #3: 非空だが不正JSONの場合もフォールバックへ回す
+        if [ -n "$json" ] && ! printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
+            echo "$(date): Invalid JSON from recall for session $sid, trying fallback" >> "$SYNC_LOG"
+            json=""
+        fi
+
+        if [ -z "$json" ]; then
+            # recall CLIで読めない場合、JSONLファイルから直接読む（フォークセッション対応）
+            # read_from_jsonlはファイル未発見で正常にexit 1を返すため、|| trueで受ける
+            json=$(read_from_jsonl "$sid") || true
+            if [ -z "$json" ]; then
+                echo "$(date): Failed to read session $sid (recall + jsonl fallback)" >> "$SYNC_LOG"
+                return 1
+            fi
+            echo "$(date): Using JSONL fallback for session $sid (recall empty)" >> "$SYNC_LOG"
+        else
+            # recall read が返したメッセージ数とJSONLのメッセージ数を比較
+            # recall read が極端に少ない場合（JSONLの半分未満）はJSONLフォールバックを使う
+            local recall_msg_count
+            recall_msg_count=$(printf '%s' "$json" | jq '(.messages // []) | length' 2>/dev/null) || recall_msg_count=0
+            local jsonl_json
+            jsonl_json=$(read_from_jsonl "$sid" 2>/dev/null) || true
+            if [ -n "$jsonl_json" ]; then
+                local jsonl_msg_count
+                jsonl_msg_count=$(printf '%s' "$jsonl_json" | jq '(.messages // []) | length' 2>/dev/null) || jsonl_msg_count=0
+                if [ "$jsonl_msg_count" -gt 0 ] && [ "$recall_msg_count" -gt 0 ] && \
+                   [ "$jsonl_msg_count" -ge $((recall_msg_count * 2)) ]; then
+                    echo "$(date): JSONL has significantly more messages ($jsonl_msg_count) than recall ($recall_msg_count) for session $sid, using JSONL" >> "$SYNC_LOG"
+                    json="$jsonl_json"
+                fi
             fi
         fi
     fi
@@ -364,7 +416,7 @@ sync_session() {
     local existing_file=""
     # shellcheck disable=SC2016
     existing_file=$(find "$OBSIDIAN_DIR" -maxdepth 1 -name '*.md' -print0 2>/dev/null | \
-        xargs -0 awk -v sid="$sid" '
+        xargs -0 awk -v sid="$persisted_sid" '
             FNR==1 { in_fm=0; found=0 }
             FNR==1 && /^---$/ { in_fm=1; next }
             in_fm && /^---$/ { in_fm=0; next }
@@ -562,10 +614,9 @@ if not safe or safe in ('.', '..'):
 print(safe)
 " "$title")
 
-    # セッションIDの短縮版をファイル名に含めて一意性を保証（レース回避）
-    # sidは$1経由で入るため、ファイル名安全な文字のみに制限
+    # 保存用セッションIDの短縮版をファイル名に含めて一意性を保証（レース回避）
     local short_sid
-    short_sid=$(printf '%s' "$sid" | tr -dc 'A-Za-z0-9_-' | cut -c1-8)
+    short_sid=$(printf '%s' "$persisted_sid" | tr -dc 'A-Za-z0-9_-' | cut -c1-8)
     # 許可文字が全くない場合のフォールバック（ハッシュで一意性確保）
     if [ -z "$short_sid" ]; then
         short_sid=$(printf '%s' "$sid" | shasum -a 256 | cut -c1-8)
@@ -607,7 +658,7 @@ print(safe)
         --date="$date_str" \
         --title="$title" \
         --source="$source_name" \
-        --session-id="$sid" \
+        --session-id="$persisted_sid" \
         --record-kind="$record_kind" \
         --tag="$source" > "$tmp_file"; then
         echo "$(date): Failed to write temp file for session $sid" >> "$SYNC_LOG"
