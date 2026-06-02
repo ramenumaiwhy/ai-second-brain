@@ -5,6 +5,8 @@
 set -euo pipefail
 umask 077
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # UTF-8ロケールを明示的に設定（macOSのmvでIllegal byte sequence対策）
 export LC_ALL=en_US.UTF-8
 export LANG=en_US.UTF-8
@@ -18,8 +20,15 @@ for cmd in recall jq python3 shasum; do
 done
 
 OBSIDIAN_DIR="${SECOND_BRAIN_DIR:?'Error: SECOND_BRAIN_DIR is not set. Set it to your notes directory.'}"
+STAGING_DIR="$HOME/.claude/dream-staging"
 SYNC_LOG="$HOME/.claude/recall-sync.log"
 LOCK_DIR="$HOME/.claude/recall-obsidian-sync.lock"
+REDACTION_HELPER="${REDACTION_HELPER:-$SCRIPT_DIR/redact-secrets.py}"
+if [ ! -f "$REDACTION_HELPER" ] && [ -f "$PWD/scripts/redact-secrets.py" ]; then
+    REDACTION_HELPER="$PWD/scripts/redact-secrets.py"
+fi
+
+mkdir -p "$HOME/.claude"
 
 # 引数でセッションIDが渡された場合はそれだけ同期、なければ全セッション
 SESSION_ID="${1:-}"
@@ -163,6 +172,52 @@ yaml_escape() {
         printf '%s' "$str" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '
 }
 
+redact_stream() {
+    if [ ! -f "$REDACTION_HELPER" ]; then
+        echo "$(date): Redaction helper not found: $REDACTION_HELPER" >> "$SYNC_LOG"
+        return 1
+    fi
+    python3 "$REDACTION_HELPER"
+}
+
+redact_value() {
+    printf '%s' "$1" | redact_stream
+}
+
+format_recall_messages_as_markdown() {
+    local json="$1"
+    local skip_count="${2:-0}"
+    local q_count="${3:-0}"
+    local a_count="${4:-0}"
+
+    printf '%s' "$json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+msgs = [m for m in data.get('messages', []) if m.get('role') in ('user', 'assistant')]
+skip = int(sys.argv[1])
+q = int(sys.argv[2])
+a = int(sys.argv[3])
+seen = 0
+for m in msgs:
+    seen += 1
+    if seen <= skip:
+        continue
+    c = m.get('content', '')
+    if isinstance(c, list):
+        c = '\n'.join(x.get('text', '') if isinstance(x, dict) and x.get('type') == 'text' else (x if isinstance(x, str) else '') for x in c)
+    elif not isinstance(c, str):
+        c = str(c)
+    if m['role'] == 'user':
+        q += 1
+        print(f'## Q{q}')
+    else:
+        a += 1
+        print(f'## A{a}')
+    print(c)
+    print()
+" "$skip_count" "$q_count" "$a_count" | redact_stream
+}
+
 sync_session() {
     local sid="$1"
     local json
@@ -184,7 +239,23 @@ sync_session() {
             echo "$(date): Failed to read session $sid (recall + jsonl fallback)" >> "$SYNC_LOG"
             return 1
         fi
-        echo "$(date): Using JSONL fallback for session $sid" >> "$SYNC_LOG"
+        echo "$(date): Using JSONL fallback for session $sid (recall empty)" >> "$SYNC_LOG"
+    else
+        # recall read が返したメッセージ数とJSONLのメッセージ数を比較
+        # recall read が極端に少ない場合（JONLの半分未満）はJSONLフォールバックを使う
+        local recall_msg_count
+        recall_msg_count=$(printf '%s' "$json" | jq '(.messages // []) | length' 2>/dev/null) || recall_msg_count=0
+        local jsonl_json
+        jsonl_json=$(read_from_jsonl "$sid" 2>/dev/null) || true
+        if [ -n "$jsonl_json" ]; then
+            local jsonl_msg_count
+            jsonl_msg_count=$(printf '%s' "$jsonl_json" | jq '(.messages // []) | length' 2>/dev/null) || jsonl_msg_count=0
+            if [ "$jsonl_msg_count" -gt 0 ] && [ "$recall_msg_count" -gt 0 ] && \
+               [ "$jsonl_msg_count" -ge $((recall_msg_count * 2)) ]; then
+                echo "$(date): JSONL has significantly more messages ($jsonl_msg_count) than recall ($recall_msg_count) for session $sid, using JSONL" >> "$SYNC_LOG"
+                json="$jsonl_json"
+            fi
+        fi
     fi
 
     # 必須フィールドの検証
@@ -209,6 +280,7 @@ sync_session() {
 
     # 既存ファイルを検索（YAML front matter内のsession_idのみマッチ、本文誤検知を防止）
     local existing_file=""
+    # shellcheck disable=SC2016
     existing_file=$(find "$OBSIDIAN_DIR" -maxdepth 1 -name '*.md' -print0 2>/dev/null | \
         xargs -0 awk -v sid="$sid" '
             FNR==1 { in_fm=0; found=0 }
@@ -254,35 +326,9 @@ sync_session() {
         q_count=$(grep -cE '^## Q[0-9]+' "$existing_file" 2>/dev/null) || true
         a_count=$(grep -cE '^## A[0-9]+' "$existing_file" 2>/dev/null) || true
 
-        # #7: 複数行メッセージ対応 + jqループ排除
         local append_content
-        append_content=$(printf '%s' "$json" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-msgs = [m for m in data.get('messages', []) if m.get('role') in ('user', 'assistant')]
-skip = int(sys.argv[1])
-q = int(sys.argv[2])
-a = int(sys.argv[3])
-seen = 0
-for m in msgs:
-    seen += 1
-    if seen <= skip:
-        continue
-    c = m.get('content', '')
-    if isinstance(c, list):
-        c = '\n'.join(x.get('text', '') if isinstance(x, dict) and x.get('type') == 'text' else (x if isinstance(x, str) else '') for x in c)
-    elif not isinstance(c, str):
-        c = str(c)
-    if m['role'] == 'user':
-        q += 1
-        print(f'## Q{q}')
-    else:
-        a += 1
-        print(f'## A{a}')
-    print(c)
-    print()
-" "$skip_count" "$q_count" "$a_count") || {
-            echo "$(date): ERROR: python3 failed during diff-append for session $sid" >> "$SYNC_LOG"
+        append_content=$(format_recall_messages_as_markdown "$json" "$skip_count" "$q_count" "$a_count") || {
+            echo "$(date): ERROR: redacted markdown generation failed during diff-append for session $sid" >> "$SYNC_LOG"
             return 1
         }
 
@@ -297,6 +343,10 @@ for m in msgs:
             printf '%s\n' "$append_content" >> "$tmp_append"
             mv -f "$tmp_append" "$existing_file"
             echo "$(date): Appended to $existing_file ($skip_count -> $recall_qa_count messages)" >> "$SYNC_LOG"
+
+            # dream-staging にもコピー（LaunchAgent が iCloud を読めないため）
+            mkdir -p "$STAGING_DIR"
+            cp -f "$existing_file" "$STAGING_DIR/$(basename "$existing_file")" 2>/dev/null || true
         fi
         return 0
     fi
@@ -304,8 +354,8 @@ for m in msgs:
     # --- 以下、新規作成 ---
 
     # ユーザーメッセージから意味のある内容を抽出してタイトルにする
-    local title
-    title=$(printf '%s' "$json" | python3 -c "
+    local raw_title title
+    raw_title=$(printf '%s' "$json" | python3 -c "
 import json, re, sys
 
 data = json.loads(sys.stdin.read())
@@ -369,6 +419,10 @@ for msg in messages:
             sys.exit(0)
 print('untitled')
 ")
+    if ! title=$(redact_value "$raw_title"); then
+        echo "$(date): Failed to redact title for session $sid" >> "$SYNC_LOG"
+        return 1
+    fi
 
     # ファイル名用にサニタイズ（パストラバーサル防止、python3でUTF-8安全に処理）
     local safe_title
@@ -413,6 +467,18 @@ print(safe)
         *) source_name="$source" ;;
     esac
 
+    # record_kind の決定: 環境変数 RECORD_KIND 優先、未設定時は source から推定
+    local record_kind
+    if [ -n "${RECORD_KIND:-}" ]; then
+        record_kind="$RECORD_KIND"
+    else
+        case "$source_name" in
+            *ChatGPT*) record_kind="chatgpt" ;;
+            *Codex*) record_kind="codex_review" ;;
+            *) record_kind="interactive" ;;
+        esac
+    fi
+
     # YAMLエスケープしたタイトル
     local escaped_title
     escaped_title=$(yaml_escape "$title")
@@ -442,6 +508,9 @@ print(safe)
         echo "title: \"$escaped_title\""
         echo "source: \"$escaped_source_name\""
         echo "session_id: \"$escaped_sid\""
+        local escaped_record_kind
+        escaped_record_kind=$(yaml_escape "$record_kind")
+        echo "record_kind: \"$escaped_record_kind\""
         echo "tags:"
         echo "  - \"$escaped_source\""
         echo "---"
@@ -449,30 +518,7 @@ print(safe)
         printf '# %s\n' "$(printf '%s' "$title" | tr -d '\n\r')"
         echo ""
 
-        # #7: 複数行メッセージ対応 + jqループ排除
-        printf '%s' "$json" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-q = 0
-a = 0
-for m in data.get('messages', []):
-    role = m.get('role', '')
-    if role not in ('user', 'assistant'):
-        continue
-    c = m.get('content', '')
-    if isinstance(c, list):
-        c = '\n'.join(x.get('text', '') if isinstance(x, dict) and x.get('type') == 'text' else (x if isinstance(x, str) else '') for x in c)
-    elif not isinstance(c, str):
-        c = str(c)
-    if role == 'user':
-        q += 1
-        print(f'## Q{q}')
-    else:
-        a += 1
-        print(f'## A{a}')
-    print(c)
-    print()
-"
+        format_recall_messages_as_markdown "$json" 0 0 0
     } > "$tmp_file" || {
         echo "$(date): Failed to write temp file for session $sid" >> "$SYNC_LOG"
         return 1
@@ -487,6 +533,10 @@ for m in data.get('messages', []):
     # 成功したらクリーンアップ不要（ファイルは移動済み）
     trap - RETURN
 
+    # dream-staging にもコピー（LaunchAgent が iCloud を読めないため）
+    mkdir -p "$STAGING_DIR"
+    cp -f "$filepath" "$STAGING_DIR/$filename" 2>/dev/null || true
+
     echo "$(date): Created $sid -> $filename" >> "$SYNC_LOG"
 }
 
@@ -497,6 +547,10 @@ if [ -L "$OBSIDIAN_DIR" ]; then
     exit 1
 fi
 mkdir -p "$OBSIDIAN_DIR"
+mkdir -p "$STAGING_DIR"
+
+# ステージングの古いファイル（14日超）をクリーンアップ
+find "$STAGING_DIR" -maxdepth 1 -name '*.md' -mtime +14 -delete 2>/dev/null || true
 
 if ! acquire_lock; then
     echo "$(date): Could not acquire lock, another sync is running" >> "$SYNC_LOG"

@@ -1,0 +1,28 @@
+{
+  "session_id": "redaction-claude-session",
+  "source": "claude",
+  "cwd": "/tmp",
+  "timestamp": "2026-06-02T10:00:00Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Please save this setup\nOPENAI_API_KEY=fake-claude-api-key",
+      "timestamp": "2026-06-02T09:59:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Use Authorization: Bearer claudeBearerToken0000000000000000000000 only in memory.",
+      "timestamp": "2026-06-02T10:00:00Z"
+    },
+    {
+      "role": "user",
+      "content": "Append this token too\nTELEGRAM_BOT_TOKEN=fake-telegram-bot-token",
+      "timestamp": "2026-06-02T10:01:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "github_token: fake-claude-github-token",
+      "timestamp": "2026-06-02T10:02:00Z"
+    }
+  ]
+}

@@ -69,18 +69,33 @@ export SECOND_BRAIN_DIR="$HOME/path/to/your/notes"
 - `jq`
 - `python3`
 - `shasum` (macOS 標準)
-- `recall` (Claude Code CLI に付属)
+- `recall` (サードパーティ CLI。[zippoxer/recall](https://github.com/zippoxer/recall) を参照)
+
+### recall のインストール
+
+```bash
+# Homebrew
+brew install zippoxer/tap/recall
+
+# または Cargo
+cargo install --git https://github.com/zippoxer/recall
+```
+
+recall は必須。同期スクリプトは起動時にコマンドの存在を確認し、無ければ即終了する。`recall read` が失敗した場合の JSONL フォールバックは内蔵しているが、recall 自体のインストールは必要。
 
 ## 注意
 
 - `SECOND_BRAIN_DIR` には**絶対パス**を指定し、**シンボリックリンクではない**ディレクトリを使うこと
 - スクリプトは symlink の保存先を拒否する安全機構を持っている
+- AI 会話ログの実体は `SECOND_BRAIN_DIR` 配下に保存し、このリポジトリには入れないこと
+- transcript 保存前に `scripts/redact-secrets.py` で redaction（秘密情報の伏せ字化）を行う
 
 ## テスト
 
 ```bash
 cd ~/ai-second-brain
 bash tests/test-sync-recall.sh
+bash tests/test-redaction.sh
 ```
 
 ## ライセンス

@@ -6,6 +6,8 @@ set -euo pipefail
 
 umask 077
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # UTF-8ロケール設定（利用可能なものから選択）
 _utf8_locale=""
 for _loc in en_US.UTF-8 C.UTF-8 POSIX; do
@@ -28,6 +30,10 @@ OBSIDIAN_DIR="${SECOND_BRAIN_DIR:?'Error: SECOND_BRAIN_DIR is not set. Set it to
 SYNC_LOG="$HOME/.claude/codex-sync.log"
 LOCK_DIR="$HOME/.claude/codex-obsidian-sync.lock"
 SID_INDEX="$HOME/.claude/codex-sid-index.tsv"
+REDACTION_HELPER="${REDACTION_HELPER:-$SCRIPT_DIR/redact-secrets.py}"
+if [ ! -f "$REDACTION_HELPER" ] && [ -f "$PWD/scripts/redact-secrets.py" ]; then
+    REDACTION_HELPER="$PWD/scripts/redact-secrets.py"
+fi
 
 # 親ディレクトリの存在を保証
 mkdir -p "$HOME/.claude"
@@ -103,6 +109,18 @@ yaml_escape() {
     local str="$1"
     python3 -c "import sys, json; print(json.dumps(sys.argv[1])[1:-1])" "$str" 2>/dev/null || \
         printf '%s' "$str" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '
+}
+
+redact_stream() {
+    if [ ! -f "$REDACTION_HELPER" ]; then
+        printf '%s: Redaction helper not found: %s\n' "$(date)" "$REDACTION_HELPER" >> "$SYNC_LOG"
+        return 1
+    fi
+    python3 "$REDACTION_HELPER"
+}
+
+redact_value() {
+    printf '%s' "$1" | redact_stream
 }
 
 # UUID形式のみ許可（8-4-4-4-12 のハイフン区切りhex、棄却方式）
@@ -352,7 +370,7 @@ for msg in messages[start:]:
         print(f'## A{a}')
         print(text)
         print()
-" "$start_index" "$start_q" "$start_a"
+" "$start_index" "$start_q" "$start_a" | redact_stream
 }
 
 sync_session_file() {
@@ -555,8 +573,8 @@ except:
     # --- 新規作成 ---
 
     # タイトル: ユーザーメッセージから意味のある内容を抽出
-    local title
-    title=$(printf '%s' "$messages_json" | python3 -c "
+    local raw_title title
+    raw_title=$(printf '%s' "$messages_json" | python3 -c "
 import json, re, sys
 
 messages = json.loads(sys.stdin.read())
@@ -609,6 +627,10 @@ for msg in messages:
             sys.exit(0)
 print('untitled')
 ")
+    if ! title=$(redact_value "$raw_title"); then
+        printf '%s: Failed to redact title for session %s\n' "$(date)" "$sid" >> "$SYNC_LOG"
+        return 1
+    fi
 
     local safe_title
     safe_title=$(sanitize_filename "$title")

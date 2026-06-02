@@ -12,6 +12,7 @@ TEST_DIR=$(mktemp -d /tmp/test-sync-recall-XXXXXX)
 PASS=0
 FAIL=0
 
+# shellcheck disable=SC2329
 cleanup() {
     rm -rf "$TEST_DIR" /tmp/recall-obsidian-sync.lock 2>/dev/null
 }
@@ -73,6 +74,7 @@ sed "s|^SYNC_LOG=.*|SYNC_LOG=\"$TEST_DIR/sync.log\"|; s|^LOCK_DIR=.*|LOCK_DIR=\"
 chmod +x "$TEST_SCRIPT"
 mkdir -p "$TEST_DIR/obsidian"
 export SECOND_BRAIN_DIR="$TEST_DIR/obsidian"
+export REDACTION_HELPER="$SCRIPT_DIR/scripts/redact-secrets.py"
 
 # ========== Test 1: 新規セッション（grep 0件でも即死しない） ==========
 echo ""
