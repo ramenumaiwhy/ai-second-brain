@@ -17,6 +17,17 @@ sys.dont_write_bytecode = True
 SCRIPT_DIR = Path(__file__).resolve().parent
 REDACTION_HELPER = Path(os.environ.get("REDACTION_HELPER", SCRIPT_DIR / "redact-secrets.py"))
 ENTRY_HEADING_RE = re.compile(r"^### (User|Assistant) \d+$")
+LEGACY_REDACTED_ASSIGNMENT_TAIL_RE = re.compile(
+    r"^(\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*)([\"'])\[REDACTED\]\3(.+)$"
+)
+LEGACY_REDACTED_COLON_TAIL_RE = re.compile(
+    r"^(\s*[\"']?([A-Za-z_][A-Za-z0-9_-]*)[\"']?\s*:\s*)([\"'])\[REDACTED\]\3(.+)$"
+)
+LEGACY_SENSITIVE_NAME_RE = re.compile(
+    r"(api[_-]?key|token|secret|password|passwd|pwd|private[_-]?key|"
+    r"access[_-]?key|client[_-]?secret|refresh[_-]?token|webhook[_-]?secret)",
+    re.IGNORECASE,
+)
 
 
 def _load_redactor():
@@ -141,6 +152,40 @@ def transcript_counts(transcript: str) -> tuple[int, int]:
         elif assistant_match:
             assistant_count = max(assistant_count, int(assistant_match.group(1)))
     return user_count, assistant_count
+
+
+def legacy_overredacted_line(body: str) -> str:
+    for pattern in (LEGACY_REDACTED_ASSIGNMENT_TAIL_RE, LEGACY_REDACTED_COLON_TAIL_RE):
+        match = pattern.match(body)
+        if match and LEGACY_SENSITIVE_NAME_RE.search(match.group(2)):
+            return f"{match.group(1)}{match.group(3)}[REDACTED]{match.group(3)}"
+    return body
+
+
+def legacy_overredacted_source_for_existing(
+    source_transcript: str,
+    existing_transcript: str,
+) -> str | None:
+    source_lines = normalize_transcript(source_transcript).splitlines(keepends=True)
+    existing_lines = normalize_transcript(existing_transcript).splitlines(keepends=True)
+    if len(source_lines) != len(existing_lines):
+        return None
+
+    aligned_lines: list[str] = []
+    for source_line, existing_line in zip(source_lines, existing_lines):
+        if source_line == existing_line:
+            aligned_lines.append(source_line)
+            continue
+
+        source_body = source_line.rstrip("\r\n")
+        existing_body = existing_line.rstrip("\r\n")
+        existing_newline = existing_line[len(existing_body) :]
+        if legacy_overredacted_line(source_body) == existing_body:
+            aligned_lines.append(existing_body + existing_newline)
+            continue
+        return None
+
+    return normalize_transcript("".join(aligned_lines))
 
 
 def split_frontmatter(markdown: str) -> tuple[list[str], str]:
@@ -332,12 +377,36 @@ def append_record(args: argparse.Namespace) -> int:
             if redacted_prefix_matches:
                 existing_transcript = redacted_existing_transcript
                 existing_entries = redacted_existing_entries
-            elif expected_last_hash and expected_last_hash != source_prefix_metadata["last_message_hash"]:
-                print("last_message_hash does not match source prefix", file=sys.stderr)
-                return 2
-            elif expected_hash and expected_hash != source_prefix_metadata["transcript_hash"]:
-                print("transcript_hash does not match source prefix", file=sys.stderr)
-                return 2
+            else:
+                legacy_source_transcript = legacy_overredacted_source_for_existing(
+                    source_prefix_transcript,
+                    existing_transcript,
+                )
+                legacy_prefix_matches = False
+                if legacy_source_transcript is not None:
+                    legacy_source_entries = parse_transcript_entries(legacy_source_transcript)
+                    legacy_source_metadata = transcript_metadata(
+                        legacy_source_transcript,
+                        legacy_source_entries,
+                    )
+                    legacy_prefix_matches = (
+                        len(legacy_source_entries) == existing_count
+                        and (
+                            not expected_last_hash
+                            or expected_last_hash == legacy_source_metadata["last_message_hash"]
+                        )
+                        and (
+                            not expected_hash
+                            or expected_hash == legacy_source_metadata["transcript_hash"]
+                        )
+                    )
+                if not legacy_prefix_matches:
+                    if expected_last_hash and expected_last_hash != source_prefix_metadata["last_message_hash"]:
+                        print("last_message_hash does not match source prefix", file=sys.stderr)
+                        return 2
+                    if expected_hash and expected_hash != source_prefix_metadata["transcript_hash"]:
+                        print("transcript_hash does not match source prefix", file=sys.stderr)
+                        return 2
 
     prefix = redact_text(prefix)
     user_count, assistant_count = transcript_counts(existing_transcript)
