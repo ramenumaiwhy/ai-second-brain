@@ -6,6 +6,7 @@ AI との会話を自動で Markdown に保存し、Obsidian などのノート�
 - **Claude Code** — `recall` CLI 経由で会話を取得
 - **Codex** (OpenAI) — JSONL セッションファイルを直接パース
 - **ChatGPT** — エクスポート JSON を変換
+- **OpenClaw/Himeno** — 重要イベントだけを source page として保存
 
 ## セットアップ
 
@@ -110,6 +111,33 @@ daily recovery は Stop hook や idle sync が取りこぼした session を、�
 
 `launchd` では1日1回の実行にする。daily recovery は候補を絞って既存の同期スクリプトへ渡すだけなので、既に最新のMarkdownは `msg_count` 判定でスキップされる。上限で古い候補が取り残されないよう、state file に最近試した候補を保存して次回は未処理候補を優先する。
 
+### 6. OpenClaw/Himeno の重要イベントを保存
+
+Himeno は常時ログを保存しない。保存対象は以下の5種類だけに絞る。
+
+- `task_result`
+- `user_decision`
+- `failure_recovery`
+- `ops_lesson`
+- `daily_summary`
+
+手動実行例:
+
+```bash
+cat <<'JSON' | ~/ai-second-brain/scripts/save-openclaw-event.py
+{
+  "record_kind": "task_result",
+  "title": "Daily recovery added",
+  "task_id": "task-123",
+  "completed_at": "2026-06-03T10:00:00+09:00",
+  "summary": "AI Second Brain に daily recovery を追加した。",
+  "next_actions": ["OpenClaw/Himeno integration を進める"]
+}
+JSON
+```
+
+保存先は `$SECOND_BRAIN_DIR/OpenClaw/sources/`。同じイベントを再実行しても、dedupe key（重複判定キー）で同じ記録として扱われるためファイルは増えない。
+
 ## スクリプト一覧
 
 | スクリプト | 用途 |
@@ -117,6 +145,7 @@ daily recovery は Stop hook や idle sync が取りこぼした session を、�
 | `scripts/record-ai-session-checkpoint.sh` | Stop hook 用の軽量 checkpoint 記録 |
 | `scripts/sync-idle-ai-sessions.sh` | idle になった checkpoint → Markdown |
 | `scripts/recover-ai-sessions-daily.sh` | 最近更新された session の日次回収 |
+| `scripts/save-openclaw-event.py` | OpenClaw/Himeno の重要イベント → source page |
 | `scripts/sync-recall-to-obsidian.sh` | Claude Code 会話 → Markdown |
 | `scripts/sync-codex-to-obsidian.sh` | Codex セッション → Markdown |
 | `scripts/convert_to_obsidian.py` | ChatGPT エクスポート → Markdown |
@@ -168,6 +197,7 @@ bash tests/test-sync-recall.sh
 bash tests/test-redaction.sh
 bash tests/test-idle-sync.sh
 bash tests/test-daily-recovery.sh
+bash tests/test-openclaw-save.sh
 ```
 
 ## ライセンス
