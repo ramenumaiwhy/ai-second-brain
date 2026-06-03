@@ -52,7 +52,7 @@ Stop hook は会話終了の確定ではなく、アシスタント返答の終�
 
 このコマンドは軽量なのでバックグラウンド化しない。`SESSION_ID` が空の場合は Claude hook の stdin JSON から `session_id` を読む。
 
-### 4. idle sync を登録
+### 4. スケジュールを登録
 
 idle sync は checkpoint を見て、最後の更新から一定時間たった session だけを同期する。デフォルトでは15分以上 idle の session を対象にする。
 
@@ -62,32 +62,23 @@ idle sync は checkpoint を見て、最後の更新から一定時間たった 
 ~/ai-second-brain/scripts/sync-idle-ai-sessions.sh
 ```
 
-macOS の `launchd` で10分ごとに実行する例:
+macOS の `launchd` には以下で登録する。`launchd` は macOS のユーザー定期実行機構だ。
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.ai-second-brain.idle-sync</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/bash</string>
-    <string>/Users/YOU/ai-second-brain/scripts/sync-idle-ai-sessions.sh</string>
-  </array>
-  <key>StartInterval</key>
-  <integer>600</integer>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>SECOND_BRAIN_DIR</key>
-    <string>/absolute/path/to/your/notes</string>
-    <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-  </dict>
-</dict>
-</plist>
+```bash
+~/ai-second-brain/scripts/install-launchd-schedules.sh
+```
+
+このコマンドは `~/Library/LaunchAgents/` に2つの plist を書く。
+
+- `com.ai-second-brain.idle-sync`: 10分ごとに idle sync を実行
+- `com.ai-second-brain.daily-recovery`: 毎日05:00に daily recovery を実行
+
+実行時に設定されている `CODEX_SESSIONS_DIR`, `CLAUDE_PROJECTS_DIR`, `AI_IDLE_MIN_AGE_SECONDS`, `AI_RECOVERY_LOOKBACK_DAYS` なども plist に埋め込む。`launchd` は `.zshrc` を読まないので、非デフォルト設定を使う場合は登録コマンドの前に環境変数を設定する。
+
+plist だけを書いて読み込まない場合:
+
+```bash
+~/ai-second-brain/scripts/install-launchd-schedules.sh --no-load
 ```
 
 古い設定から移行する場合は、Stop hook から `sync-recall-to-obsidian.sh` や `sync-codex-to-obsidian.sh` を直接呼ぶ行を消し、`record-ai-session-checkpoint.sh` に置き換える。
@@ -109,7 +100,7 @@ daily recovery は Stop hook や idle sync が取りこぼした session を、�
 ~/ai-second-brain/scripts/recover-ai-sessions-daily.sh
 ```
 
-`launchd` では1日1回の実行にする。daily recovery は候補を絞って既存の同期スクリプトへ渡すだけなので、既に最新のMarkdownは `msg_count` 判定でスキップされる。上限で古い候補が取り残されないよう、state file に最近試した候補を保存して次回は未処理候補を優先する。
+`install-launchd-schedules.sh` は daily recovery を1日1回に登録する。daily recovery は候補を絞って既存の同期スクリプトへ渡すだけなので、既に最新のMarkdownは `msg_count` 判定でスキップされる。上限で古い候補が取り残されないよう、state file に最近試した候補を保存して次回は未処理候補を優先する。
 
 ### 6. OpenClaw/Himeno の重要イベントを保存
 
@@ -143,6 +134,7 @@ JSON
 | スクリプト | 用途 |
 |-----------|------|
 | `scripts/record-ai-session-checkpoint.sh` | Stop hook 用の軽量 checkpoint 記録 |
+| `scripts/install-launchd-schedules.sh` | idle sync と daily recovery の LaunchAgent 登録 |
 | `scripts/sync-idle-ai-sessions.sh` | idle になった checkpoint → Markdown |
 | `scripts/recover-ai-sessions-daily.sh` | 最近更新された session の日次回収 |
 | `scripts/save-openclaw-event.py` | OpenClaw/Himeno の重要イベント → source page |
@@ -159,6 +151,12 @@ JSON
 | `CODEX_SESSIONS_DIR` | No | `~/.codex/sessions` | Codex JSONL の場所 |
 | `AI_SECOND_BRAIN_STATE_DIR` | No | `~/.claude/ai-second-brain-state` | checkpoint 状態ファイルの場所 |
 | `AI_IDLE_MIN_AGE_SECONDS` | No | `900` | idle sync 対象になるまでの秒数 |
+| `AI_IDLE_MAX_SESSIONS` | No | `20` | idle sync 1回あたりの最大候補数 |
+| `AI_LAUNCHD_IDLE_INTERVAL_SECONDS` | No | `600` | idle sync LaunchAgent の実行間隔 |
+| `AI_LAUNCHD_DAILY_HOUR` | No | `5` | daily recovery LaunchAgent の実行時刻（時） |
+| `AI_LAUNCHD_DAILY_MINUTE` | No | `0` | daily recovery LaunchAgent の実行時刻（分） |
+| `AI_LAUNCHD_PATH` | No | `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` | LaunchAgent 用 PATH |
+| `AI_LAUNCH_AGENTS_DIR` | No | `~/Library/LaunchAgents` | plist 書き込み先 |
 | `AI_RECOVERY_LOOKBACK_DAYS` | No | `3` | daily recovery が見る過去日数 |
 | `AI_RECOVERY_MAX_SESSIONS` | No | `50` | daily recovery 1回あたりの最大候補数 |
 | `CLAUDE_PROJECTS_DIR` | No | `~/.claude/projects` | Claude Code JSONL fallback の場所 |
@@ -198,6 +196,7 @@ bash tests/test-redaction.sh
 bash tests/test-idle-sync.sh
 bash tests/test-daily-recovery.sh
 bash tests/test-openclaw-save.sh
+bash tests/test-launchd-schedules.sh
 ```
 
 ## ライセンス
