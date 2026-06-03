@@ -129,6 +129,22 @@ JSON
 
 保存先は `$SECOND_BRAIN_DIR/OpenClaw/sources/`。同じイベントを再実行しても、dedupe key（重複判定キー）で同じ記録として扱われるためファイルは増えない。
 
+### 7. Summary を後から更新
+
+Transcript は保存したまま、上部の `Summary`, `Decisions`, `Next Actions` だけを後から更新できる。
+
+```bash
+cat <<'JSON' | ~/ai-second-brain/scripts/update-ai-log-summary.py "$SECOND_BRAIN_DIR/2026-06-03_example.md"
+{
+  "summary": "この会話では AI ログ保存の運用を整理した。",
+  "decisions": ["Transcript は保持する"],
+  "next_actions": ["必要なときだけ summary を更新する"]
+}
+JSON
+```
+
+このスクリプトは transcript を書き換えず、要約側だけを redaction に通して `summary_refreshed_at` を frontmatter に残す。
+
 ## スクリプト一覧
 
 | スクリプト | 用途 |
@@ -138,6 +154,7 @@ JSON
 | `scripts/sync-idle-ai-sessions.sh` | idle になった checkpoint → Markdown |
 | `scripts/recover-ai-sessions-daily.sh` | 最近更新された session の日次回収 |
 | `scripts/save-openclaw-event.py` | OpenClaw/Himeno の重要イベント → source page |
+| `scripts/update-ai-log-summary.py` | 保存済みAIログの Summary/Decisions/Next Actions 更新 |
 | `scripts/sync-recall-to-obsidian.sh` | Claude Code 会話 → Markdown |
 | `scripts/sync-codex-to-obsidian.sh` | Codex セッション → Markdown |
 | `scripts/convert_to_obsidian.py` | ChatGPT エクスポート → Markdown |
@@ -197,6 +214,7 @@ bash tests/test-idle-sync.sh
 bash tests/test-daily-recovery.sh
 bash tests/test-openclaw-save.sh
 bash tests/test-launchd-schedules.sh
+bash tests/test-summary-refresh.sh
 ```
 
 ## ライセンス
