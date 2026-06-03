@@ -325,6 +325,8 @@ for m in msgs:
     seen += 1
     if seen <= skip:
         continue
+    if m.get('omitted'):
+        continue
     c = m.get('content', '')
     if isinstance(c, list):
         c = '\n'.join(x.get('text', '') if isinstance(x, dict) and x.get('type') == 'text' else (x if isinstance(x, str) else '') for x in c)
@@ -338,7 +340,99 @@ for m in msgs:
         print(f'## A{a}')
     print(c)
     print()
-" "$skip_count" "$q_count" "$a_count" | redact_stream
+	" "$skip_count" "$q_count" "$a_count" | redact_stream
+}
+
+legacy_aligned_skip_count() {
+    local messages_json="$1"
+    local existing_file="$2"
+    local fallback_skip="${3:-0}"
+
+    printf '%s' "$messages_json" | python3 -c "
+import json
+import re
+import sys
+
+existing_path = sys.argv[1]
+fallback = int(sys.argv[2])
+
+
+def normalize(text):
+    text = text.replace('\r\n', '\n').replace('\r', '\n').strip()
+    return '\n'.join(line.rstrip() for line in text.split('\n'))
+
+
+def message_text(message):
+    value = message.get('text', message.get('content', ''))
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(str(item.get('text', '')))
+            elif isinstance(item, str):
+                parts.append(item)
+        return '\n'.join(parts)
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def legacy_sections(path):
+    sections = []
+    current = None
+    body = []
+    in_code = False
+    fence = chr(96) * 3
+    try:
+        lines = open(path, 'r', encoding='utf-8', errors='replace').read().splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        if line.startswith(fence):
+            in_code = not in_code
+        if not in_code and re.match(r'^## [QA][0-9]+$', line.strip()):
+            if current is not None:
+                sections.append(normalize('\n'.join(body)))
+            current = line.strip()
+            body = []
+            continue
+        if current is not None:
+            body.append(line)
+    if current is not None:
+        sections.append(normalize('\n'.join(body)))
+    return [section for section in sections if section]
+
+
+try:
+    data = json.load(sys.stdin)
+except json.JSONDecodeError:
+    print(fallback)
+    sys.exit(0)
+
+messages = data.get('messages', data) if isinstance(data, dict) else data
+if not isinstance(messages, list):
+    print(fallback)
+    sys.exit(0)
+
+targets = legacy_sections(existing_path)
+if not targets:
+    print(fallback)
+    sys.exit(0)
+
+matched = 0
+for index, message in enumerate(messages):
+    if not isinstance(message, dict) or message.get('omitted'):
+        continue
+    if message.get('role') not in ('user', 'assistant'):
+        continue
+    if matched < len(targets) and normalize(message_text(message)) == targets[matched]:
+        matched += 1
+        if matched == len(targets):
+            print(max(index + 1, fallback))
+            sys.exit(0)
+
+print(fallback)
+" "$existing_file" "$fallback_skip"
 }
 
 sync_session() {
@@ -412,6 +506,18 @@ sync_session() {
         return 1
     fi
 
+    local raw_json filtered_json omitted_msg_count
+    raw_json="$json"
+    if ! filtered_json=$(printf '%s' "$raw_json" | ai_log_writer filter); then
+        echo "$(date): ai-log noise filter failed for session $sid" >> "$SYNC_LOG"
+        return 1
+    fi
+    omitted_msg_count=$(printf '%s' "$filtered_json" | jq -r '.omitted_count // 0')
+    if ! [[ "$omitted_msg_count" =~ ^[0-9]+$ ]]; then
+        echo "$(date): Invalid omitted message count for session $sid" >> "$SYNC_LOG"
+        return 1
+    fi
+
     # 既存ファイルを検索（YAML front matter内のsession_idのみマッチ、本文誤検知を防止）
     local existing_file=""
     # shellcheck disable=SC2016
@@ -427,16 +533,19 @@ sync_session() {
         ' 2>/dev/null | head -1) || true
 
     # メッセージ数を取得（nullセーフ）
-    local msg_count
-    msg_count=$(printf '%s' "$json" | jq '(.messages // []) | length')
-    if ! [[ "$msg_count" =~ ^[0-9]+$ ]]; then
+    local raw_msg_count msg_count
+    raw_msg_count=$(printf '%s' "$raw_json" | jq '[(.messages // [])[] | select(.role == "user" or .role == "assistant")] | length')
+    msg_count=$(printf '%s' "$filtered_json" | jq '(.messages // []) | length')
+    if ! [[ "$raw_msg_count" =~ ^[0-9]+$ ]] || ! [[ "$msg_count" =~ ^[0-9]+$ ]]; then
         echo "$(date): Invalid message count for session $sid" >> "$SYNC_LOG"
         return 1
     fi
-    if [ "$msg_count" -eq 0 ]; then
+    if [ -z "$existing_file" ] && [ "$msg_count" -eq 0 ]; then
         echo "$(date): No messages for session $sid, skipping" >> "$SYNC_LOG"
         return 0
     fi
+
+    json="$filtered_json"
 
     # 既存ファイルがある場合 → 差分追記
     if [ -n "$existing_file" ]; then
@@ -447,7 +556,7 @@ sync_session() {
                 echo "$(date): Skipping $existing_file (missing/invalid msg_count in frontmatter)" >> "$SYNC_LOG"
                 return 0
             fi
-            if [ "$msg_count" -le "$existing_msg_count" ]; then
+            if [ "$msg_count" -le "$existing_msg_count" ] && [ "$raw_msg_count" -le "$existing_msg_count" ]; then
                 return 0
             fi
 
@@ -456,7 +565,8 @@ sync_session() {
                 echo "$(date): Failed to create temp file for shared append" >> "$SYNC_LOG"
                 return 1
             }
-            if ! printf '%s' "$json" | ai_log_writer append --existing-file "$existing_file" > "$tmp_shared"; then
+            if ! printf '%s' "$raw_json" | ai_log_writer append \
+                --existing-file "$existing_file" > "$tmp_shared"; then
                 rm -f "$tmp_shared" 2>/dev/null || true
                 echo "$(date): Shared append failed for $existing_file" >> "$SYNC_LOG"
                 return 1
@@ -476,24 +586,40 @@ sync_session() {
         local existing_qa_count
         existing_qa_count=$(grep -cE '^## [QA][0-9]+' "$existing_file" 2>/dev/null) || true
 
-        # recall側のuser+assistantメッセージ数を算出
-        local recall_qa_count
-        recall_qa_count=$(printf '%s' "$json" | jq '[(.messages // [])[] | select(.role == "user" or .role == "assistant")] | length')
+        local existing_msg_count
+        existing_msg_count=$(get_frontmatter_msg_count "$existing_file")
 
-        # 新しいメッセージがなければスキップ
-        if [ "$recall_qa_count" -le "$existing_qa_count" ]; then
+        local append_json="$json"
+        local source_qa_count
+        source_qa_count=$(printf '%s' "$append_json" | jq '[(.messages // [])[] | select(.role == "user" or .role == "assistant")] | length')
+
+        # raw と filtered の件数が違う場合は元ログ位置で追記する。
+        local skip_count="$existing_qa_count"
+        if [ "$raw_msg_count" -ne "$msg_count" ]; then
+            if [ "$existing_msg_count" -ne -1 ] && [ "$existing_msg_count" -gt "$skip_count" ]; then
+                skip_count="$existing_msg_count"
+            fi
+            if [ "$raw_msg_count" -le "$skip_count" ]; then
+                return 0
+            fi
+            if ! append_json=$(printf '%s' "$raw_json" | ai_log_writer filter --include-omitted); then
+                echo "$(date): ai-log indexed noise filter failed for session $sid" >> "$SYNC_LOG"
+                return 1
+            fi
+            source_qa_count="$raw_msg_count"
+            skip_count=$(legacy_aligned_skip_count "$append_json" "$existing_file" "$skip_count")
+        elif [ "$source_qa_count" -le "$existing_qa_count" ]; then
             return 0
         fi
 
         # 差分メッセージを追記（既存のQ/A数以降を出力）
-        local skip_count="$existing_qa_count"
         local q_count a_count
         # 既存ファイルから最後のQ/A番号を取得
         q_count=$(grep -cE '^## Q[0-9]+' "$existing_file" 2>/dev/null) || true
         a_count=$(grep -cE '^## A[0-9]+' "$existing_file" 2>/dev/null) || true
 
         local append_content
-        append_content=$(format_recall_messages_as_markdown "$json" "$skip_count" "$q_count" "$a_count") || {
+        append_content=$(format_recall_messages_as_markdown "$append_json" "$skip_count" "$q_count" "$a_count") || {
             echo "$(date): ERROR: redacted markdown generation failed during diff-append for session $sid" >> "$SYNC_LOG"
             return 1
         }
@@ -507,8 +633,42 @@ sync_session() {
             }
             cat "$existing_file" > "$tmp_append"
             printf '%s\n' "$append_content" >> "$tmp_append"
+            if [ "$existing_msg_count" -ne -1 ]; then
+                python3 -c "
+import sys
+
+path = sys.argv[1]
+new_count = sys.argv[2]
+with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+    lines = handle.readlines()
+
+result = []
+in_fm = False
+fm_closed = False
+updated = False
+for line in lines:
+    stripped = line.rstrip('\n')
+    if not fm_closed and stripped == '---':
+        if not in_fm:
+            in_fm = True
+        else:
+            in_fm = False
+            fm_closed = True
+        result.append(line)
+        continue
+    if in_fm and line.startswith('msg_count: '):
+        result.append(f'msg_count: {new_count}\n')
+        updated = True
+        continue
+    result.append(line)
+
+if updated:
+    with open(path, 'w', encoding='utf-8') as handle:
+        handle.writelines(result)
+" "$tmp_append" "$source_qa_count"
+            fi
             mv -f "$tmp_append" "$existing_file"
-            echo "$(date): Appended to $existing_file ($skip_count -> $recall_qa_count messages)" >> "$SYNC_LOG"
+            echo "$(date): Appended to $existing_file ($skip_count -> $source_qa_count messages)" >> "$SYNC_LOG"
 
             # dream-staging にもコピー（LaunchAgent が iCloud を読めないため）
             mkdir -p "$STAGING_DIR"
@@ -660,6 +820,7 @@ print(safe)
         --source="$source_name" \
         --session-id="$persisted_sid" \
         --record-kind="$record_kind" \
+        --omitted-msg-count="$omitted_msg_count" \
         --tag="$source" > "$tmp_file"; then
         echo "$(date): Failed to write temp file for session $sid" >> "$SYNC_LOG"
         return 1

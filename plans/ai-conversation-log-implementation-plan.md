@@ -230,12 +230,59 @@ Acceptance criteria:
 - Summary refresh can be skipped without losing the raw conversation.
 - The user can ask any future LLM to read the Markdown directly.
 
+## Phase 8: Readable Archive Noise Control
+
+Goal: keep heartbeat/cron and other routine automation chatter out of readable
+AI logs without hiding useful task content.
+
+Reference design:
+
+- Save external reference links and implementation takeaways in
+  `docs/ai-log-reference-practices.md`.
+- Keep `SECOND_BRAIN_DIR` as the readable Markdown archive.
+- Keep routine checkpoint/retry/no-op state under `AI_SECOND_BRAIN_STATE_DIR`
+  and sync logs.
+- Omit only explicit automation wrapper messages from transcript generation.
+- Keep normal messages that merely discuss heartbeat or cron.
+
+Tasks:
+
+- Add a shared conservative noise filter to the AI log writer.
+- Make the filter produce a normalized message count before Codex/Claude sync
+  decides whether to create or append a note.
+- Add `omitted_msg_count` frontmatter when source messages were filtered.
+- Make existing append logic update `omitted_msg_count` without changing
+  transcript hashes for kept messages.
+- Add tests that prove:
+  - explicit heartbeat wrapper messages are omitted;
+  - explicit cron wrapper messages are omitted;
+  - ordinary user discussion about cron/heartbeat is preserved;
+  - all-filtered sessions create no Markdown file;
+  - OpenClaw still rejects unsupported `heartbeat` record kinds.
+- Update README with the readable archive policy and the escape hatch for
+  disabling the filter.
+
+Acceptance criteria:
+
+- Routine automation wrapper chatter does not flood the vault.
+- Meaningful task records are still saved.
+- Existing logs remain append-compatible.
+- The filter is conservative and configurable.
+- All existing shell tests still pass.
+
 ## Testing Plan
 
 Run order for implementation changes:
 
 ```bash
 bash tests/test-sync-recall.sh
+bash tests/test-redaction.sh
+bash tests/test-ai-log-noise-filter.sh
+bash tests/test-idle-sync.sh
+bash tests/test-daily-recovery.sh
+bash tests/test-openclaw-save.sh
+bash tests/test-launchd-schedules.sh
+bash tests/test-summary-refresh.sh
 ```
 
 If TypeScript or Node code is added later, follow the local policy:

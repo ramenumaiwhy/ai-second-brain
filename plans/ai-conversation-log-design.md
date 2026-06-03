@@ -15,6 +15,7 @@ The data should stay useful even if a specific service, model, app, or chat UI d
 - Avoid depending on Codex, Claude, OpenClaw, Obsidian, or any single vendor for recall.
 - Keep enough raw transcript to reconstruct the original conversation.
 - Keep summary sections above the transcript so daily use does not require reading everything.
+- Keep routine automation noise out of the human-facing notes.
 
 ## Non-goals
 
@@ -24,6 +25,7 @@ The data should stay useful even if a specific service, model, app, or chat UI d
 - Do not require JSONL as the primary archive format.
 - Do not try to perfectly detect when a conversation is truly finished.
 - Do not save secrets, API keys, tokens, or `.env` content into Second Brain.
+- Do not treat heartbeat, cron, or checkpoint chatter as knowledge.
 
 ## Storage Model
 
@@ -41,6 +43,34 @@ $SECOND_BRAIN_DIR/
 ```
 
 This preserves the existing layout. A future migration can add `AI-Logs/`, but version 1 should not require moving old notes. Moving the vault structure first would create work without improving recall.
+
+## Readable Archive Policy
+
+The vault is a readable archive, not an operations log sink.
+
+Use three tiers:
+
+1. Human-facing Markdown records.
+   These are the files under `SECOND_BRAIN_DIR` that people and LLMs should
+   read first. They keep `Summary`, `Decisions`, `Next Actions`, and
+   `Transcript`.
+2. Source transcript.
+   This is the saved user/assistant conversation inside `Transcript`. It may
+   omit explicit automation wrapper chatter when the wrapper itself is not part
+   of the task.
+3. Operational state.
+   This lives outside the vault under `AI_SECOND_BRAIN_STATE_DIR` or in sync
+   logs. It includes checkpoint timestamps, retry counters, no-op recovery
+   reports, and launchd output.
+
+Routine `heartbeat`, `cron`, `checkpoint`, and no-op automation messages do not
+belong in tier 1. If automation finds nothing, update state only. If automation
+finds a meaningful result, failure, recovery, user decision, or lesson, save
+that result as a structured record.
+
+This policy follows the reference notes in
+`docs/ai-log-reference-practices.md`: mature AI logging workflows keep durable
+Markdown, but avoid self-expanding noisy vaults.
 
 ## Record Shape
 
@@ -104,6 +134,12 @@ Second Brain にMarkdownで残す運用を整理した。
 - `transcript_hash`: hash of all saved normalized transcript messages. This catches broader saved-content drift after parser changes, forks, or source log rewrites.
 - `tags`: at minimum, source tag plus `ai-log`.
 
+Optional operational fields:
+
+- `omitted_msg_count`: number of source messages omitted by the noise filter.
+  This is for auditability only. It does not mean the omitted messages were
+  useful knowledge.
+
 ## Body Sections
 
 - `Summary`: short summary for quick reading.
@@ -120,6 +156,10 @@ Second Brain にMarkdownで残す運用を整理した。
 Codex source logs live under `~/.codex/sessions`.
 
 The existing `scripts/sync-codex-to-obsidian.sh` parses Codex JSONL session files and writes Markdown. It should keep doing that, but the output should follow the shared record shape.
+
+Codex sessions created by recurring jobs may contain automation wrapper chatter.
+The sync path should keep user/assistant task content, but may omit messages
+that match the repository's explicit automation-noise rules.
 
 ### Claude Code
 
@@ -194,6 +234,27 @@ Before writing to Second Brain, mask obvious secrets:
 
 If masking is uncertain, prefer saving a redacted placeholder over writing the raw value.
 
+## Noise Rules
+
+Noise filtering must be conservative.
+
+Default filtering may omit only messages that are clearly automation wrappers,
+for example:
+
+- Messages whose first meaningful line is an explicit heartbeat marker.
+- Messages whose first meaningful line is an explicit cron marker.
+- Messages whose first meaningful line is an explicit automation status marker.
+- XML-like automation wrappers only when `status`, `state`, `result`, and the
+  body are all no-op values. Extra attributes, warnings, failures, or concrete
+  results must be kept.
+- Empty messages after redaction.
+
+Do not filter a normal user or assistant message merely because it mentions the
+words "heartbeat" or "cron". A user asking about cron is knowledge. A generated
+"cron automation completed; no changes" wrapper is not.
+
+When in doubt, keep the message.
+
 ## Repository Role
 
 This repository should contain:
@@ -214,4 +275,5 @@ This repository should not contain private conversation logs. The logs belong in
 - Avoid Stop-hook full sync.
 - Use idle save plus daily recovery.
 - Treat OpenClaw/Himeno as an operations memory source, not a transcript firehose.
+- Treat heartbeat/cron no-op output as operational state, not Second Brain content.
 - Build small reliability checks before expanding scope.

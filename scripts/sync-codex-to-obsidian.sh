@@ -408,6 +408,8 @@ q = int(sys.argv[2])
 a = int(sys.argv[3])
 
 for msg in messages[start:]:
+    if msg.get('omitted'):
+        continue
     role = msg['role']
     text = msg['text']
     if role == 'user':
@@ -420,7 +422,99 @@ for msg in messages[start:]:
         print(f'## A{a}')
         print(text)
         print()
-" "$start_index" "$start_q" "$start_a" | redact_stream
+	" "$start_index" "$start_q" "$start_a" | redact_stream
+}
+
+legacy_aligned_skip_count() {
+    local messages_json="$1"
+    local existing_file="$2"
+    local fallback_skip="${3:-0}"
+
+    printf '%s' "$messages_json" | python3 -c "
+import json
+import re
+import sys
+
+existing_path = sys.argv[1]
+fallback = int(sys.argv[2])
+
+
+def normalize(text):
+    text = text.replace('\r\n', '\n').replace('\r', '\n').strip()
+    return '\n'.join(line.rstrip() for line in text.split('\n'))
+
+
+def message_text(message):
+    value = message.get('text', message.get('content', ''))
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(str(item.get('text', '')))
+            elif isinstance(item, str):
+                parts.append(item)
+        return '\n'.join(parts)
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def legacy_sections(path):
+    sections = []
+    current = None
+    body = []
+    in_code = False
+    fence = chr(96) * 3
+    try:
+        lines = open(path, 'r', encoding='utf-8', errors='replace').read().splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        if line.startswith(fence):
+            in_code = not in_code
+        if not in_code and re.match(r'^## [QA][0-9]+$', line.strip()):
+            if current is not None:
+                sections.append(normalize('\n'.join(body)))
+            current = line.strip()
+            body = []
+            continue
+        if current is not None:
+            body.append(line)
+    if current is not None:
+        sections.append(normalize('\n'.join(body)))
+    return [section for section in sections if section]
+
+
+try:
+    data = json.load(sys.stdin)
+except json.JSONDecodeError:
+    print(fallback)
+    sys.exit(0)
+
+messages = data.get('messages', data) if isinstance(data, dict) else data
+if not isinstance(messages, list):
+    print(fallback)
+    sys.exit(0)
+
+targets = legacy_sections(existing_path)
+if not targets:
+    print(fallback)
+    sys.exit(0)
+
+matched = 0
+for index, message in enumerate(messages):
+    if not isinstance(message, dict) or message.get('omitted'):
+        continue
+    if message.get('role') not in ('user', 'assistant'):
+        continue
+    if matched < len(targets) and normalize(message_text(message)) == targets[matched]:
+        matched += 1
+        if matched == len(targets):
+            print(max(index + 1, fallback))
+            sys.exit(0)
+
+print(fallback)
+" "$existing_file" "$fallback_skip"
 }
 
 sync_session_file() {
@@ -459,7 +553,7 @@ sync_session_file() {
     fi
 
     # メッセージ抽出（{count, messages} 形式）
-    local extract_result
+    local extract_result raw_extract_result filtered_extract_result
     if ! extract_result=$(extract_messages "$jsonl_file"); then
         printf '%s: extract_messages failed for %s\n' "$(date)" "$jsonl_file" >> "$SYNC_LOG"
         return 1
@@ -467,21 +561,40 @@ sync_session_file() {
     if [ -z "$extract_result" ]; then
         return 0
     fi
+    raw_extract_result="$extract_result"
 
-    local msg_count
-    msg_count=$(printf '%s' "$extract_result" | jq -r '.count')
-    if [ "$msg_count" -eq 0 ]; then
-        return 0
+    if ! filtered_extract_result=$(printf '%s' "$raw_extract_result" | ai_log_writer filter); then
+        printf '%s: ai-log noise filter failed for %s\n' "$(date)" "$jsonl_file" >> "$SYNC_LOG"
+        return 1
+    fi
+
+    local omitted_msg_count
+    omitted_msg_count=$(printf '%s' "$filtered_extract_result" | jq -r '.omitted_count // 0')
+    if ! [[ "$omitted_msg_count" =~ ^[0-9]+$ ]]; then
+        printf '%s: Invalid omitted message count for %s\n' "$(date)" "$jsonl_file" >> "$SYNC_LOG"
+        return 1
+    fi
+
+    local raw_msg_count msg_count
+    raw_msg_count=$(printf '%s' "$raw_extract_result" | jq -r '.count')
+    msg_count=$(printf '%s' "$filtered_extract_result" | jq -r '.count')
+    if ! [[ "$raw_msg_count" =~ ^[0-9]+$ ]] || ! [[ "$msg_count" =~ ^[0-9]+$ ]]; then
+        printf '%s: Invalid message count for %s\n' "$(date)" "$jsonl_file" >> "$SYNC_LOG"
+        return 1
     fi
 
     local messages_json
-    messages_json=$(printf '%s' "$extract_result" | jq -c '.messages')
+    messages_json=$(printf '%s' "$filtered_extract_result" | jq -c '.messages')
 
     # フロントマター範囲限定で既存ファイルを検索
     local existing_file=""
     if ! existing_file=$(find_existing_by_sid "$sid" "$OBSIDIAN_DIR"); then
         printf '%s: find_existing_by_sid failed for sid=%s\n' "$(date)" "$sid" >> "$SYNC_LOG"
         return 1
+    fi
+
+    if [ -z "$existing_file" ] && [ "$msg_count" -eq 0 ]; then
+        return 0
     fi
 
     # 差分追記チェック（フロントマターの msg_count ベース）
@@ -500,13 +613,14 @@ sync_session_file() {
             return 0
         fi
 
-        if [ "$msg_count" -le "$existing_msg_count" ]; then
-            return 0
-        fi
-
         if is_shared_ai_log_record "$existing_file"; then
+            if [ "$msg_count" -le "$existing_msg_count" ] && [ "$raw_msg_count" -le "$existing_msg_count" ]; then
+                return 0
+            fi
+
             tmp_file=$(mktemp "$OBSIDIAN_DIR/.tmp_update.XXXXXX") || return 1
-            if ! printf '%s' "$messages_json" | ai_log_writer append --existing-file "$existing_file" > "$tmp_file"; then
+            if ! printf '%s' "$raw_extract_result" | ai_log_writer append \
+                --existing-file "$existing_file" > "$tmp_file"; then
                 printf '%s: Shared append failed for %s\n' "$(date)" "$existing_file" >> "$SYNC_LOG"
                 return 1
             fi
@@ -521,6 +635,25 @@ sync_session_file() {
             fi
             tmp_file=""
             printf '%s: Appended to %s (%s -> %s)\n' "$(date)" "$existing_file" "$existing_msg_count" "$msg_count" >> "$SYNC_LOG"
+            return 0
+        fi
+
+        local legacy_messages_json="$messages_json"
+        local legacy_new_msg_count="$msg_count"
+        local legacy_skip_count="$existing_msg_count"
+        if [ "$raw_msg_count" -ne "$msg_count" ]; then
+            if [ "$raw_msg_count" -le "$existing_msg_count" ]; then
+                return 0
+            fi
+            local indexed_extract_result
+            if ! indexed_extract_result=$(printf '%s' "$raw_extract_result" | ai_log_writer filter --include-omitted); then
+                printf '%s: ai-log indexed noise filter failed for %s\n' "$(date)" "$jsonl_file" >> "$SYNC_LOG"
+                return 1
+            fi
+            legacy_messages_json=$(printf '%s' "$indexed_extract_result" | jq -c '.messages')
+            legacy_new_msg_count="$raw_msg_count"
+            legacy_skip_count=$(legacy_aligned_skip_count "$legacy_messages_json" "$existing_file" "$existing_msg_count")
+        elif [ "$msg_count" -le "$existing_msg_count" ]; then
             return 0
         fi
 
@@ -553,7 +686,7 @@ except (OSError, UnicodeDecodeError):
 
         # 差分メッセージを一時ファイルに書き出し（巨大セッション対策: シェル変数保持を回避）
         append_tmp=$(mktemp "$OBSIDIAN_DIR/.tmp_append.XXXXXX") || return 1
-        format_messages_as_markdown "$messages_json" "$existing_msg_count" "$q_count" "$a_count" > "$append_tmp"
+        format_messages_as_markdown "$legacy_messages_json" "$legacy_skip_count" "$q_count" "$a_count" > "$append_tmp"
 
         if [ -s "$append_tmp" ]; then
             # 単一トランザクション: msg_count更新 + 差分追記を1回の tmpfile → os.replace で実行
@@ -626,13 +759,13 @@ except:
     except OSError:
         pass
     raise
-" "$existing_file" "$msg_count" "$append_tmp"; then
+" "$existing_file" "$legacy_new_msg_count" "$append_tmp"; then
                 printf '%s: atomic update failed for %s\n' "$(date)" "$existing_file" >> "$SYNC_LOG"
                 return 1
             fi
             rm -f "$append_tmp" 2>/dev/null
             append_tmp=""
-            printf '%s: Appended to %s (%s -> %s)\n' "$(date)" "$existing_file" "$existing_msg_count" "$msg_count" >> "$SYNC_LOG"
+            printf '%s: Appended to %s (%s -> %s)\n' "$(date)" "$existing_file" "$existing_msg_count" "$legacy_new_msg_count" >> "$SYNC_LOG"
         else
             rm -f "$append_tmp" 2>/dev/null
             append_tmp=""
@@ -724,6 +857,7 @@ print('untitled')
         --source="Codex" \
         --session-id="$sid" \
         --record-kind="$record_kind" \
+        --omitted-msg-count="$omitted_msg_count" \
         --tag="codex" > "$tmp_file"; then
         printf '%s: Failed to write temp file for session %s\n' "$(date)" "$sid" >> "$SYNC_LOG"
         return 1

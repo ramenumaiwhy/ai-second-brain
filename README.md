@@ -145,6 +145,21 @@ JSON
 
 このスクリプトは transcript を書き換えず、要約側だけを redaction に通して `summary_refreshed_at` を frontmatter に残す。
 
+### 8. heartbeat/cron ノイズの扱い
+
+このリポジトリは Second Brain を readable archive として扱う。readable archive は、人間と LLM が読むための保存場所だ。heartbeat や cron の「何もなかった」通知は知識ではないので、通常は Markdown ノートにしない。
+
+Codex / Claude Code の同期では、明示的な automation wrapper（自動実行の状態通知）だけを保守的に省く。普通の会話で `heartbeat` や `cron` という単語が出てきた場合は保存する。
+
+省かれたメッセージがある場合は frontmatter に `omitted_msg_count` を残す。本文には routine chatter を入れない。
+
+フィルタを一時的に無効にする場合:
+
+```bash
+AI_LOG_NOISE_FILTER=0 ~/ai-second-brain/scripts/sync-recall-to-obsidian.sh "$SESSION_ID"
+AI_LOG_NOISE_FILTER=0 ~/ai-second-brain/scripts/sync-codex-to-obsidian.sh "$CODEX_JSONL_FILE"
+```
+
 ## スクリプト一覧
 
 | スクリプト | 用途 |
@@ -177,6 +192,8 @@ JSON
 | `AI_RECOVERY_LOOKBACK_DAYS` | No | `3` | daily recovery が見る過去日数 |
 | `AI_RECOVERY_MAX_SESSIONS` | No | `50` | daily recovery 1回あたりの最大候補数 |
 | `CLAUDE_PROJECTS_DIR` | No | `~/.claude/projects` | Claude Code JSONL fallback の場所 |
+| `AI_LOG_NOISE_FILTER` | No | `1` | 明示的な heartbeat/cron automation wrapper を省く。`0`, `false`, `no`, `off` で無効 |
+| `AI_LOG_NOISE_PATTERNS_FILE` | No | — | 追加の省略パターンを1行1正規表現で指定 |
 
 ## 依存コマンド
 
@@ -210,6 +227,7 @@ recall は必須。同期スクリプトは起動時にコマンドの存在を�
 cd ~/ai-second-brain
 bash tests/test-sync-recall.sh
 bash tests/test-redaction.sh
+bash tests/test-ai-log-noise-filter.sh
 bash tests/test-idle-sync.sh
 bash tests/test-daily-recovery.sh
 bash tests/test-openclaw-save.sh
