@@ -5,7 +5,21 @@
 set -euo pipefail
 umask 077
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    local dir
+    while [ -L "$source" ]; do
+        dir="$(cd -P "$(dirname "$source")" && pwd)"
+        source="$(readlink "$source")"
+        case "$source" in
+            /*) ;;
+            *) source="$dir/$source" ;;
+        esac
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_dir)"
 
 # UTF-8ロケールを明示的に設定（macOSのmvでIllegal byte sequence対策）
 export LC_ALL=en_US.UTF-8
@@ -307,6 +321,208 @@ ai_log_writer() {
     REDACTION_AUDIT_LOG="$SYNC_LOG" REDACTION_HELPER="$REDACTION_HELPER" python3 "$AI_LOG_WRITER" "$@"
 }
 
+ai_log_session_name() {
+    python3 -c "
+import re, sys
+name = re.sub(r'[^A-Za-z0-9_.:-]+', '-', sys.argv[1]).strip('-') or 'session'
+print(name[:180])
+" "$1"
+}
+
+ai_log_month() {
+    printf '%s' "${1%-??}"
+}
+
+file_sha256() {
+    local file="$1"
+    printf 'sha256:%s' "$(shasum -a 256 "$file" | awk '{print $1}')"
+}
+
+frontmatter_value() {
+    local file="$1"
+    local key="$2"
+    python3 - "$file" "$key" <<'PY'
+import json
+import sys
+
+path, target_key = sys.argv[1:3]
+try:
+    lines = open(path, "r", encoding="utf-8", errors="replace").read().splitlines()
+except OSError:
+    sys.exit(1)
+if not lines or lines[0] != "---":
+    sys.exit(1)
+for line in lines[1:]:
+    if line == "---":
+        break
+    if not line.startswith(target_key + ":"):
+        continue
+    raw = line.split(":", 1)[1].strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw[1:-1]
+    else:
+        value = raw.strip("'")
+    print(value)
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+
+is_ai_logs_raw_file() {
+    local file="$1"
+    python3 - "$OBSIDIAN_DIR" "$file" <<'PY'
+import os
+import sys
+
+root = os.path.realpath(sys.argv[1])
+path = os.path.realpath(sys.argv[2])
+raw_root = os.path.join(root, "AI-Logs", "raw")
+sys.exit(0 if path.startswith(raw_root + os.sep) else 1)
+PY
+}
+
+write_readable_log() {
+    local raw_json="$1"
+    local date_str="$2"
+    local title="$3"
+    local source_name="$4"
+    local source_key="$5"
+    local raw_session_id="$6"
+    local record_kind="$7"
+    local raw_file="$8"
+    local omitted_msg_count="$9"
+
+    local readable_dir readable_file raw_ref raw_hash tmp_readable readable_meta
+    readable_meta=$(python3 - "$OBSIDIAN_DIR" "$raw_file" "$source_key" "$date_str" <<'PY'
+import os
+import sys
+
+root, raw_file, source_key, date_str = sys.argv[1:5]
+root_real = os.path.realpath(root)
+raw_real = os.path.realpath(raw_file)
+try:
+    rel = os.path.relpath(raw_real, root_real).replace(os.sep, "/")
+except ValueError:
+    rel = ""
+if rel.startswith("AI-Logs/raw/") and rel.endswith(".md"):
+    raw_stem = rel[:-3]
+    readable_rel = "AI-Logs/readable/" + raw_stem[len("AI-Logs/raw/"):] + ".md"
+else:
+    session_name = os.path.basename(raw_file[:-3] if raw_file.endswith(".md") else raw_file)
+    month = date_str.rsplit("-", 1)[0]
+    raw_stem = f"AI-Logs/raw/{source_key}/{month}/{session_name}"
+    readable_rel = f"AI-Logs/readable/{source_key}/{month}/{session_name}.md"
+print(f"[[{raw_stem}]]")
+print(os.path.join(root, *readable_rel.split("/")))
+PY
+)
+    raw_ref=$(printf '%s\n' "$readable_meta" | sed -n '1p')
+    readable_file=$(printf '%s\n' "$readable_meta" | sed -n '2p')
+    readable_dir="$(dirname "$readable_file")"
+    raw_hash=$(file_sha256 "$raw_file")
+
+    mkdir -p "$readable_dir"
+    tmp_readable=$(mktemp "$readable_dir/.tmp.XXXXXX") || return 1
+    if ! printf '%s' "$raw_json" | ai_log_writer readable \
+        --date="$date_str" \
+        --title="$title" \
+        --source="$source_name" \
+        --raw-session-id="$raw_session_id" \
+        --raw-ref="$raw_ref" \
+        --raw-hash="$raw_hash" \
+        --record-kind="$record_kind" \
+        --omitted-msg-count=0 \
+        --tag="$source_key" > "$tmp_readable"; then
+        rm -f "$tmp_readable" 2>/dev/null || true
+        return 1
+    fi
+    mv -f "$tmp_readable" "$readable_file"
+}
+
+find_existing_by_sid() {
+    local sid="$1"
+    local target_dir="$2"
+    python3 -c "
+import os, sys
+
+sid = sys.argv[1]
+target_dir = sys.argv[2]
+target_lines = {'session_id: ' + sid, 'session_id: \"' + sid + '\"'}
+real_dir = os.path.realpath(target_dir)
+search_roots = [
+    (os.path.join(target_dir, 'AI-Logs', 'raw'), True),
+    (os.path.join(target_dir, 'AI-Logs', 'raw-archive'), True),
+    (target_dir, False),
+]
+seen = set()
+
+def iter_markdown(root, recursive):
+    if not os.path.isdir(root) or os.path.islink(root):
+        return
+    root_real = os.path.realpath(root)
+    if not recursive:
+        try:
+            names = os.listdir(root)
+        except OSError:
+            return
+        for fname in names:
+            if not fname.endswith('.md'):
+                continue
+            fpath = os.path.join(root, fname)
+            real_path = os.path.realpath(fpath)
+            if real_path in seen:
+                continue
+            seen.add(real_path)
+            if os.path.islink(fpath) or not os.path.isfile(fpath):
+                continue
+            yield fpath
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            dirname
+            for dirname in dirnames
+            if not os.path.islink(os.path.join(dirpath, dirname))
+            and os.path.realpath(os.path.join(dirpath, dirname)) != os.path.join(real_dir, 'AI-Logs', 'readable')
+        ]
+        for fname in filenames:
+            if not fname.endswith('.md'):
+                continue
+            fpath = os.path.join(dirpath, fname)
+            real_path = os.path.realpath(fpath)
+            if real_path in seen:
+                continue
+            seen.add(real_path)
+            if os.path.islink(fpath):
+                continue
+            if not real_path.startswith(root_real + os.sep) and real_path != root_real:
+                continue
+            yield fpath
+
+for root, recursive in search_roots:
+    for fpath in iter_markdown(root, recursive):
+        if not os.path.realpath(fpath).startswith(real_dir + os.sep):
+            continue
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                in_frontmatter = False
+                for line in f:
+                    line = line.rstrip('\n')
+                    if line == '---':
+                        if not in_frontmatter:
+                            in_frontmatter = True
+                            continue
+                        break
+                    if in_frontmatter and line in target_lines:
+                        print(fpath)
+                        sys.exit(0)
+        except (OSError, UnicodeDecodeError):
+            continue
+" "$sid" "$target_dir"
+}
+
 format_recall_messages_as_markdown() {
     local json="$1"
     local skip_count="${2:-0}"
@@ -520,17 +736,7 @@ sync_session() {
 
     # 既存ファイルを検索（YAML front matter内のsession_idのみマッチ、本文誤検知を防止）
     local existing_file=""
-    # shellcheck disable=SC2016
-    existing_file=$(find "$OBSIDIAN_DIR" -maxdepth 1 -name '*.md' -print0 2>/dev/null | \
-        xargs -0 awk -v sid="$persisted_sid" '
-            FNR==1 { in_fm=0; found=0 }
-            FNR==1 && /^---$/ { in_fm=1; next }
-            in_fm && /^---$/ { in_fm=0; next }
-            in_fm && /^session_id:/ {
-                gsub(/^session_id:[ \t]*"?/, ""); gsub(/"?[ \t]*$/, "")
-                if ($0 == sid) { print FILENAME; found=1; exit }
-            }
-        ' 2>/dev/null | head -1) || true
+    existing_file=$(find_existing_by_sid "$persisted_sid" "$OBSIDIAN_DIR") || true
 
     # メッセージ数を取得（nullセーフ）
     local raw_msg_count msg_count
@@ -577,6 +783,15 @@ sync_session() {
             fi
             mv -f "$tmp_shared" "$existing_file"
             echo "$(date): Appended to $existing_file ($existing_msg_count -> $msg_count messages)" >> "$SYNC_LOG"
+            if is_ai_logs_raw_file "$existing_file"; then
+                local existing_title existing_record_kind
+                existing_title=$(frontmatter_value "$existing_file" title 2>/dev/null || printf 'untitled')
+                existing_record_kind=$(frontmatter_value "$existing_file" record_kind 2>/dev/null || printf '%s' "${RECORD_KIND:-interactive}")
+                if ! write_readable_log "$raw_json" "$date_str" "$existing_title" "$(frontmatter_value "$existing_file" source 2>/dev/null || printf '%s' "$source")" "$source" "$persisted_sid" "$existing_record_kind" "$existing_file" "$omitted_msg_count"; then
+                    echo "$(date): Failed to update readable log for $existing_file" >> "$SYNC_LOG"
+                    return 1
+                fi
+            fi
             mkdir -p "$STAGING_DIR"
             cp -f "$existing_file" "$STAGING_DIR/$(basename "$existing_file")" 2>/dev/null || true
             return 0
@@ -750,40 +965,6 @@ print('untitled')
         return 1
     fi
 
-    # ファイル名用にサニタイズ（パストラバーサル防止、python3でUTF-8安全に処理）
-    local safe_title
-    safe_title=$(python3 -c "
-import re
-import sys
-title = sys.argv[1]
-# 制御文字を除去（改行・タブ含む）
-safe = re.sub(r'[\x00-\x1f\x7f]', '', title)
-# 危険な文字を除去（<>:\"/\\|?*/）
-safe = re.sub(r'[<>:\"/\\\\|?*/]', '', safe)
-# 空白全般をアンダースコアに（改行・タブ残留防止）
-safe = re.sub(r'[\s]+', '_', safe)
-# 連続アンダースコアを1つに
-safe = re.sub(r'_+', '_', safe)
-# 先頭/末尾のドットを除去
-safe = safe.strip('.')
-# 50文字に切り詰め
-safe = safe[:50]
-# 空、.、.. ならuntitled
-if not safe or safe in ('.', '..'):
-    safe = 'untitled'
-print(safe)
-" "$title")
-
-    # 保存用セッションIDの短縮版をファイル名に含めて一意性を保証（レース回避）
-    local short_sid
-    short_sid=$(printf '%s' "$persisted_sid" | tr -dc 'A-Za-z0-9_-' | cut -c1-8)
-    # 許可文字が全くない場合のフォールバック（ハッシュで一意性確保）
-    if [ -z "$short_sid" ]; then
-        short_sid=$(printf '%s' "$sid" | shasum -a 256 | cut -c1-8)
-    fi
-    local filename="${date_str}_${safe_title}_${short_sid}.md"
-    local filepath="$OBSIDIAN_DIR/$filename"
-
     # source名を整形
     local source_name
     case "$source" in
@@ -804,9 +985,23 @@ print(safe)
         esac
     fi
 
+    local source_key month session_name raw_dir filename filepath readable_dir
+    source_key="$source"
+    case "$source_key" in
+        claude|codex|chatgpt|telegram|openclaw) ;;
+        *) source_key="unknown" ;;
+    esac
+    month=$(ai_log_month "$date_str")
+    session_name=$(ai_log_session_name "$persisted_sid")
+    raw_dir="$OBSIDIAN_DIR/AI-Logs/raw/$source_key/$month"
+    readable_dir="$OBSIDIAN_DIR/AI-Logs/readable/$source_key/$month"
+    filename="$session_name.md"
+    filepath="$raw_dir/$filename"
+    mkdir -p "$raw_dir" "$readable_dir"
+
     # 一時ファイルに書き出してからアトミックにmv（同一FS内で作成）
     local tmp_file
-    tmp_file=$(mktemp "$OBSIDIAN_DIR/.tmp.XXXXXX") || {
+    tmp_file=$(mktemp "$raw_dir/.tmp.XXXXXX") || {
         echo "$(date): Failed to create temp file for session $sid" >> "$SYNC_LOG"
         return 1
     }
@@ -826,6 +1021,17 @@ print(safe)
         return 1
     fi
 
+    # 衝突回避: 同名ファイルが既に存在すれば連番サフィックスを付加
+    if [ -e "$filepath" ]; then
+        local base="${filepath%.md}"
+        local n=1
+        while [ -e "${base}_${n}.md" ]; do
+            n=$((n + 1))
+        done
+        filepath="${base}_${n}.md"
+        filename="$(basename "$filepath")"
+    fi
+
     # アトミックに移動
     mv "$tmp_file" "$filepath" || {
         echo "$(date): Failed to move temp file for session $sid" >> "$SYNC_LOG"
@@ -835,11 +1041,16 @@ print(safe)
     # 成功したらクリーンアップ不要（ファイルは移動済み）
     trap - RETURN
 
+    if ! write_readable_log "$raw_json" "$date_str" "$title" "$source_name" "$source_key" "$persisted_sid" "$record_kind" "$filepath" "$omitted_msg_count"; then
+        echo "$(date): Failed to write readable file for session $sid" >> "$SYNC_LOG"
+        return 1
+    fi
+
     # dream-staging にもコピー（LaunchAgent が iCloud を読めないため）
     mkdir -p "$STAGING_DIR"
     cp -f "$filepath" "$STAGING_DIR/$filename" 2>/dev/null || true
 
-    echo "$(date): Created $sid -> $filename" >> "$SYNC_LOG"
+    echo "$(date): Created $sid -> $filepath" >> "$SYNC_LOG"
 }
 
 # メイン処理

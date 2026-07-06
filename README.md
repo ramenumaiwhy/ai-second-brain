@@ -8,6 +8,13 @@ AI との会話を自動で Markdown に保存し、Obsidian などのノート�
 - **ChatGPT** — エクスポート JSON を変換
 - **OpenClaw/Himeno** — 重要イベントだけを source page として保存
 
+保存レイアウト:
+
+- `AI-Logs/raw/<source>/YYYY-MM/<session_id>.md` — redaction 済み transcript。追記と復旧の基準になる保存実体。
+- `AI-Logs/readable/<source>/YYYY-MM/<session_id>.md` — 人間と LLM が普段読む派生ビュー。短い作業実況や明示的な automation wrapper は省く。
+
+Claude Code / Codex の新規 AI ログは `AI-Logs/raw` と `AI-Logs/readable` に分けて保存する。root 直下の旧 AI ログは互換のため追記対象として残す。ChatGPT 公式エクスポートの変換（`convert_to_obsidian.py`）は現時点では従来どおり root 直下に書く。ChatGPT 変換の移設は別作業として扱う。
+
 ## セットアップ
 
 ### 1. クローン
@@ -131,10 +138,10 @@ JSON
 
 ### 7. Summary を後から更新
 
-Transcript は保存したまま、上部の `Summary`, `Decisions`, `Next Actions` だけを後から更新できる。
+Transcript は保存したまま、上部の `Summary`, `Decisions`, `Next Actions` を後から挿入・更新できる。新規作成時には空の summary セクションは作らない。
 
 ```bash
-cat <<'JSON' | ~/ai-second-brain/scripts/update-ai-log-summary.py "$SECOND_BRAIN_DIR/2026-06-03_example.md"
+cat <<'JSON' | ~/ai-second-brain/scripts/update-ai-log-summary.py "$SECOND_BRAIN_DIR/AI-Logs/raw/codex/2026-06/<session_id>.md"
 {
   "summary": "この会話では AI ログ保存の運用を整理した。",
   "decisions": ["Transcript は保持する"],
@@ -151,13 +158,43 @@ JSON
 
 Codex / Claude Code の同期では、明示的な automation wrapper（自動実行の状態通知）だけを保守的に省く。普通の会話で `heartbeat` や `cron` という単語が出てきた場合は保存する。
 
-省かれたメッセージがある場合は frontmatter に `omitted_msg_count` を残す。本文には routine chatter を入れない。
+省かれたメッセージがある場合は frontmatter に `omitted_msg_count` を残す。readable には routine chatter を入れない。raw は普段の検索対象から外し、必要なときだけ readable 末尾の `Raw` リンクから辿る。
 
 フィルタを一時的に無効にする場合:
 
 ```bash
 AI_LOG_NOISE_FILTER=0 ~/ai-second-brain/scripts/sync-recall-to-obsidian.sh "$SESSION_ID"
 AI_LOG_NOISE_FILTER=0 ~/ai-second-brain/scripts/sync-codex-to-obsidian.sh "$CODEX_JSONL_FILE"
+```
+
+普段の検索には raw と raw-archive を除外する helper を使う:
+
+```bash
+~/ai-second-brain/scripts/search-second-brain.sh "検索語"
+```
+
+Obsidian アプリの検索やファイル一覧でも raw を普段見ないようにするには、vault ごとに1回だけ Excluded files（除外ファイル設定）を入れる。この設定は `SECOND_BRAIN_DIR` からの相対パスではなく、Obsidian vault root からの相対パスで書く。
+
+この環境のように vault root が `.../Documents/notes` で、`SECOND_BRAIN_DIR` がその配下の `Second-Brain` の場合は、Obsidian の `設定` → `ファイルとリンク` → `Excluded files` に以下を追加する:
+
+```text
+Second-Brain/AI-Logs/raw
+Second-Brain/AI-Logs/raw-archive
+```
+
+`SECOND_BRAIN_DIR` 自体を Obsidian vault root にしている環境では、代わりに以下を追加する:
+
+```text
+AI-Logs/raw
+AI-Logs/raw-archive
+```
+
+この設定は raw を削除しない。必要なときは readable 末尾の `Raw` リンクか、ファイルブラウザで除外設定を一時的に外して辿る。
+
+旧 root 直下ログを整理する前には、まず dry-run manifest を出す。これは読み取り専用で、ファイル移動や削除はしない。
+
+```bash
+~/ai-second-brain/scripts/plan-root-ai-log-archive.py --format tsv
 ```
 
 ## スクリプト一覧
@@ -170,6 +207,8 @@ AI_LOG_NOISE_FILTER=0 ~/ai-second-brain/scripts/sync-codex-to-obsidian.sh "$CODE
 | `scripts/recover-ai-sessions-daily.sh` | 最近更新された session の日次回収 |
 | `scripts/save-openclaw-event.py` | OpenClaw/Himeno の重要イベント → source page |
 | `scripts/update-ai-log-summary.py` | 保存済みAIログの Summary/Decisions/Next Actions 更新 |
+| `scripts/search-second-brain.sh` | raw/raw-archive を除外して Second Brain を検索 |
+| `scripts/plan-root-ai-log-archive.py` | 旧 root 直下AIログの raw-archive 退避計画を dry-run 出力 |
 | `scripts/sync-recall-to-obsidian.sh` | Claude Code 会話 → Markdown |
 | `scripts/sync-codex-to-obsidian.sh` | Codex セッション → Markdown |
 | `scripts/convert_to_obsidian.py` | ChatGPT エクスポート → Markdown |
@@ -187,7 +226,7 @@ AI_LOG_NOISE_FILTER=0 ~/ai-second-brain/scripts/sync-codex-to-obsidian.sh "$CODE
 | `AI_LAUNCHD_IDLE_INTERVAL_SECONDS` | No | `600` | idle sync LaunchAgent の実行間隔 |
 | `AI_LAUNCHD_DAILY_HOUR` | No | `5` | daily recovery LaunchAgent の実行時刻（時） |
 | `AI_LAUNCHD_DAILY_MINUTE` | No | `0` | daily recovery LaunchAgent の実行時刻（分） |
-| `AI_LAUNCHD_PATH` | No | `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` | LaunchAgent 用 PATH |
+| `AI_LAUNCHD_PATH` | No | `~/.local/bin:~/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` | LaunchAgent 用 PATH |
 | `AI_LAUNCH_AGENTS_DIR` | No | `~/Library/LaunchAgents` | plist 書き込み先 |
 | `AI_RECOVERY_LOOKBACK_DAYS` | No | `3` | daily recovery が見る過去日数 |
 | `AI_RECOVERY_MAX_SESSIONS` | No | `50` | daily recovery 1回あたりの最大候補数 |

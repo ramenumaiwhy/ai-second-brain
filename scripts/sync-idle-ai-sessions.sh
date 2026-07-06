@@ -5,7 +5,21 @@ set -euo pipefail
 
 umask 077
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    local dir
+    while [ -L "$source" ]; do
+        dir="$(cd -P "$(dirname "$source")" && pwd)"
+        source="$(readlink "$source")"
+        case "$source" in
+            /*) ;;
+            *) source="$dir/$source" ;;
+        esac
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_dir)"
 
 STATE_DIR="${AI_SECOND_BRAIN_STATE_DIR:-$HOME/.claude/ai-second-brain-state}"
 STATE_FILE="$STATE_DIR/idle-checkpoints.json"
@@ -60,8 +74,10 @@ lock_lstart() {
 pid_matches_lstart() {
     local pid="$1" expected_lstart="$2" current_lstart
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    [ -n "$expected_lstart" ] && [ "$expected_lstart" != "unknown" ] || return 1
     kill -0 "$pid" 2>/dev/null || return 1
+    if [ -z "$expected_lstart" ] || [ "$expected_lstart" = "unknown" ]; then
+        return 0
+    fi
     current_lstart=$(ps -p "$pid" -o lstart= 2>/dev/null || true)
     [ -n "$current_lstart" ] && [ "$current_lstart" = "$expected_lstart" ]
 }

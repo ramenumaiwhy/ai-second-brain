@@ -6,7 +6,21 @@ set -euo pipefail
 
 umask 077
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    local dir
+    while [ -L "$source" ]; do
+        dir="$(cd -P "$(dirname "$source")" && pwd)"
+        source="$(readlink "$source")"
+        case "$source" in
+            /*) ;;
+            *) source="$dir/$source" ;;
+        esac
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_dir)"
 
 # UTF-8ロケール設定（利用可能なものから選択）
 _utf8_locale=""
@@ -138,6 +152,127 @@ ai_log_writer() {
         return 1
     fi
     REDACTION_AUDIT_LOG="$SYNC_LOG" REDACTION_HELPER="$REDACTION_HELPER" python3 "$AI_LOG_WRITER" "$@"
+}
+
+ai_log_session_name() {
+    python3 -c "
+import re, sys
+name = re.sub(r'[^A-Za-z0-9_.:-]+', '-', sys.argv[1]).strip('-') or 'session'
+print(name[:180])
+" "$1"
+}
+
+ai_log_month() {
+    printf '%s' "${1%-??}"
+}
+
+file_sha256() {
+    local file="$1"
+    printf 'sha256:%s' "$(shasum -a 256 "$file" | awk '{print $1}')"
+}
+
+frontmatter_value() {
+    local file="$1"
+    local key="$2"
+    python3 - "$file" "$key" <<'PY'
+import json
+import sys
+
+path, target_key = sys.argv[1:3]
+try:
+    lines = open(path, "r", encoding="utf-8", errors="replace").read().splitlines()
+except OSError:
+    sys.exit(1)
+if not lines or lines[0] != "---":
+    sys.exit(1)
+for line in lines[1:]:
+    if line == "---":
+        break
+    if not line.startswith(target_key + ":"):
+        continue
+    raw = line.split(":", 1)[1].strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw[1:-1]
+    else:
+        value = raw.strip("'")
+    print(value)
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+
+is_ai_logs_raw_file() {
+    local file="$1"
+    python3 - "$OBSIDIAN_DIR" "$file" <<'PY'
+import os
+import sys
+
+root = os.path.realpath(sys.argv[1])
+path = os.path.realpath(sys.argv[2])
+raw_root = os.path.join(root, "AI-Logs", "raw")
+sys.exit(0 if path.startswith(raw_root + os.sep) else 1)
+PY
+}
+
+write_readable_log() {
+    local raw_json="$1"
+    local date_str="$2"
+    local title="$3"
+    local source_name="$4"
+    local source_key="$5"
+    local raw_session_id="$6"
+    local record_kind="$7"
+    local raw_file="$8"
+    local omitted_msg_count="$9"
+
+    local readable_dir readable_file raw_ref raw_hash tmp_readable readable_meta
+    readable_meta=$(python3 - "$OBSIDIAN_DIR" "$raw_file" "$source_key" "$date_str" <<'PY'
+import os
+import sys
+
+root, raw_file, source_key, date_str = sys.argv[1:5]
+root_real = os.path.realpath(root)
+raw_real = os.path.realpath(raw_file)
+try:
+    rel = os.path.relpath(raw_real, root_real).replace(os.sep, "/")
+except ValueError:
+    rel = ""
+if rel.startswith("AI-Logs/raw/") and rel.endswith(".md"):
+    raw_stem = rel[:-3]
+    readable_rel = "AI-Logs/readable/" + raw_stem[len("AI-Logs/raw/"):] + ".md"
+else:
+    session_name = os.path.basename(raw_file[:-3] if raw_file.endswith(".md") else raw_file)
+    month = date_str.rsplit("-", 1)[0]
+    raw_stem = f"AI-Logs/raw/{source_key}/{month}/{session_name}"
+    readable_rel = f"AI-Logs/readable/{source_key}/{month}/{session_name}.md"
+print(f"[[{raw_stem}]]")
+print(os.path.join(root, *readable_rel.split("/")))
+PY
+)
+    raw_ref=$(printf '%s\n' "$readable_meta" | sed -n '1p')
+    readable_file=$(printf '%s\n' "$readable_meta" | sed -n '2p')
+    readable_dir="$(dirname "$readable_file")"
+    raw_hash=$(file_sha256 "$raw_file")
+
+    mkdir -p "$readable_dir"
+    tmp_readable=$(mktemp "$readable_dir/.tmp.XXXXXX") || return 1
+    if ! printf '%s' "$raw_json" | ai_log_writer readable \
+        --date="$date_str" \
+        --title="$title" \
+        --source="$source_name" \
+        --raw-session-id="$raw_session_id" \
+        --raw-ref="$raw_ref" \
+        --raw-hash="$raw_hash" \
+        --record-kind="$record_kind" \
+        --omitted-msg-count=0 \
+        --tag="$source_key" > "$tmp_readable"; then
+        rm -f "$tmp_readable" 2>/dev/null || true
+        return 1
+    fi
+    mv -f "$tmp_readable" "$readable_file"
 }
 
 # UUID形式のみ許可（8-4-4-4-12 のハイフン区切りhex、棄却方式）
@@ -274,14 +409,14 @@ find_existing_by_sid() {
             local real_cached real_target
             real_cached=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$cached_path")
             real_target=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$target_dir")
-            if [[ "$real_cached" == "$real_target/"* ]]; then
+            if [[ "$real_cached" == "$real_target/"* ]] && [[ "$real_cached" != "$real_target/AI-Logs/readable/"* ]]; then
                 printf '%s' "$cached_path"
                 return 0
             fi
         fi
     fi
 
-    # 2. フォールバック: 全件走査（フロントマター内 session_id、シンボリックリンク除外）
+    # 2. フォールバック: raw/raw-archiveを優先し、readableは検索しない
     python3 -c "
 import os, sys
 
@@ -290,31 +425,79 @@ target_dir = sys.argv[2]
 # 引用符あり/なし両方にマッチ (recall側は quoted, codex側は unquoted)
 target_lines = {'session_id: ' + sid, 'session_id: \"' + sid + '\"'}
 real_dir = os.path.realpath(target_dir)
+search_roots = [
+    (os.path.join(target_dir, 'AI-Logs', 'raw'), True),
+    (os.path.join(target_dir, 'AI-Logs', 'raw-archive'), True),
+    (target_dir, False),
+]
+seen = set()
 
-for fname in os.listdir(target_dir):
-    if not fname.endswith('.md'):
-        continue
-    fpath = os.path.join(target_dir, fname)
-    if os.path.islink(fpath):
-        continue
-    if not os.path.realpath(fpath).startswith(real_dir + os.sep):
-        continue
-    try:
-        with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-            in_frontmatter = False
-            for line in f:
-                line = line.rstrip('\n')
-                if line == '---':
-                    if not in_frontmatter:
-                        in_frontmatter = True
-                        continue
-                    else:
-                        break
-                if in_frontmatter and line in target_lines:
-                    print(fpath)
-                    sys.exit(0)
-    except (OSError, UnicodeDecodeError):
-        continue
+def iter_markdown(root, recursive):
+    if not os.path.isdir(root) or os.path.islink(root):
+        return
+    root_real = os.path.realpath(root)
+    if not recursive:
+        try:
+            names = os.listdir(root)
+        except OSError:
+            return
+        for fname in names:
+            if not fname.endswith('.md'):
+                continue
+            fpath = os.path.join(root, fname)
+            real_path = os.path.realpath(fpath)
+            if real_path in seen:
+                continue
+            seen.add(real_path)
+            if os.path.islink(fpath) or not os.path.isfile(fpath):
+                continue
+            yield fpath
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            dirname
+            for dirname in dirnames
+            if not os.path.islink(os.path.join(dirpath, dirname))
+            and os.path.realpath(os.path.join(dirpath, dirname)) != os.path.join(real_dir, 'AI-Logs', 'readable')
+        ]
+        for fname in filenames:
+            if not fname.endswith('.md'):
+                continue
+            fpath = os.path.join(dirpath, fname)
+            real_path = os.path.realpath(fpath)
+            if real_path in seen:
+                continue
+            seen.add(real_path)
+            if os.path.islink(fpath):
+                continue
+            if not real_path.startswith(root_real + os.sep) and real_path != root_real:
+                continue
+            yield fpath
+
+for root, recursive in search_roots:
+    for fpath in iter_markdown(root, recursive):
+        if not os.path.realpath(fpath).startswith(real_dir + os.sep):
+            continue
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                in_frontmatter = False
+                for line in f:
+                    line = line.rstrip('\n')
+                    if line == '---':
+                        if not in_frontmatter:
+                            in_frontmatter = True
+                            continue
+                        else:
+                            break
+                    if in_frontmatter and line in target_lines:
+                        print(fpath)
+                        sys.exit(0)
+        except (OSError, UnicodeDecodeError):
+            continue
+        if root == target_dir:
+            # Legacy compatibility: root direct children were the old storage surface.
+            # Nested generated views are intentionally not used for session lookup.
+            pass
 " "$sid" "$target_dir"
 }
 
@@ -635,6 +818,15 @@ sync_session_file() {
             fi
             tmp_file=""
             printf '%s: Appended to %s (%s -> %s)\n' "$(date)" "$existing_file" "$existing_msg_count" "$msg_count" >> "$SYNC_LOG"
+            if is_ai_logs_raw_file "$existing_file"; then
+                local existing_title existing_record_kind
+                existing_title=$(frontmatter_value "$existing_file" title 2>/dev/null || printf 'untitled')
+                existing_record_kind=$(frontmatter_value "$existing_file" record_kind 2>/dev/null || printf '%s' "${RECORD_KIND:-interactive}")
+                if ! write_readable_log "$raw_extract_result" "$date_str" "$existing_title" "Codex" "codex" "$sid" "$existing_record_kind" "$existing_file" "$omitted_msg_count"; then
+                    printf '%s: Failed to update readable log for %s\n' "$(date)" "$existing_file" >> "$SYNC_LOG"
+                    return 1
+                fi
+            fi
             return 0
         fi
 
@@ -835,18 +1027,20 @@ print('untitled')
         return 1
     fi
 
-    local safe_title
-    safe_title=$(sanitize_filename "$title")
-
-    local short_sid
-    short_sid=$(printf '%s' "$sid" | cut -c1-8)
-    local filename="${date_str}_${safe_title}_${short_sid}.md"
-    local filepath="$OBSIDIAN_DIR/$filename"
-
     local record_kind
     record_kind="${RECORD_KIND:-interactive}"
 
-    tmp_file=$(mktemp "$OBSIDIAN_DIR/.tmp.XXXXXX") || {
+    local source_key month session_name raw_dir filename filepath readable_dir
+    source_key="codex"
+    month=$(ai_log_month "$date_str")
+    session_name=$(ai_log_session_name "$sid")
+    raw_dir="$OBSIDIAN_DIR/AI-Logs/raw/$source_key/$month"
+    readable_dir="$OBSIDIAN_DIR/AI-Logs/readable/$source_key/$month"
+    filename="$session_name.md"
+    filepath="$raw_dir/$filename"
+    mkdir -p "$raw_dir" "$readable_dir"
+
+    tmp_file=$(mktemp "$raw_dir/.tmp.XXXXXX") || {
         printf '%s: Failed to create temp file for session %s\n' "$(date)" "$sid" >> "$SYNC_LOG"
         return 1
     }
@@ -897,10 +1091,15 @@ try:
     os.fsync(dir_fd)
 finally:
     os.close(dir_fd)
-" "$OBSIDIAN_DIR"
+" "$raw_dir"
+
+    if ! write_readable_log "$raw_extract_result" "$date_str" "$title" "Codex" "$source_key" "$sid" "$record_kind" "$filepath" "$omitted_msg_count"; then
+        printf '%s: Failed to write readable file for session %s\n' "$(date)" "$sid" >> "$SYNC_LOG"
+        return 1
+    fi
 
     update_sid_index "$sid" "$filepath"
-    printf '%s: Created %s -> %s\n' "$(date)" "$sid" "$(basename "$filepath")" >> "$SYNC_LOG"
+    printf '%s: Created %s -> %s\n' "$(date)" "$sid" "$filepath" >> "$SYNC_LOG"
 }
 
 # --- メイン処理 ---

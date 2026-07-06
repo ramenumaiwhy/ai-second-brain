@@ -8,6 +8,8 @@ SCRIPT="$REPO_DIR/scripts/recover-ai-sessions-daily.sh"
 TEST_DIR=$(mktemp -d /tmp/test-daily-recovery-XXXXXX)
 PASS=0
 FAIL=0
+export SECOND_BRAIN_DIR="$TEST_DIR/default-second-brain"
+mkdir -p "$SECOND_BRAIN_DIR"
 
 cleanup() {
     rm -rf "$TEST_DIR" 2>/dev/null
@@ -68,6 +70,17 @@ line_count() {
     else
         printf '0'
     fi
+}
+
+saved_markdown_count() {
+    local root="$1"
+    find "$root" \( -path "$root/AI-Logs/readable" -prune \) -o -name '*.md' -type f -print 2>/dev/null | wc -l | tr -d ' '
+}
+
+saved_grep_count() {
+    local pattern="$1" root="$2"
+    find "$root" \( -path "$root/AI-Logs/readable" -prune \) -o -name '*.md' -type f -print0 2>/dev/null | \
+        xargs -0 grep -l "$pattern" 2>/dev/null | wc -l | tr -d ' '
 }
 
 state_value() {
@@ -398,7 +411,7 @@ else
 fi
 
 assert_eq "noid existing recovery succeeds" "0" "$NOID_EXISTING_EXIT"
-assert_eq "noid existing does not create duplicate markdown" "1" "$(find "$NOID_EXISTING_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')"
+assert_eq "noid existing does not create duplicate markdown" "1" "$(saved_markdown_count "$NOID_EXISTING_OBSIDIAN")"
 assert_contains "noid existing bare note remains bare" "$NOID_EXISTING_OBSIDIAN/existing.md" "session_id: \"noid-session\""
 assert_contains "noid existing stores bare path" "$NOID_EXISTING_STATE_DIR/daily-recovery.json" "noid-session.jsonl"
 
@@ -453,7 +466,7 @@ else
 fi
 
 assert_eq "stale existing recovery succeeds" "0" "$STALE_EXISTING_EXIT"
-assert_eq "stale existing does not create duplicate markdown" "1" "$(find "$STALE_EXISTING_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')"
+assert_eq "stale existing does not create duplicate markdown" "1" "$(saved_markdown_count "$STALE_EXISTING_OBSIDIAN")"
 assert_contains "stale existing appends newer transcript" "$STALE_EXISTING_OBSIDIAN/existing.md" "stale parent second"
 assert_contains "stale existing bare note remains bare" "$STALE_EXISTING_OBSIDIAN/existing.md" "session_id: \"stale-session\""
 
@@ -521,7 +534,7 @@ else
 fi
 
 assert_eq "legacy existing recovery succeeds" "0" "$LEGACY_EXISTING_EXIT"
-assert_eq "legacy existing does not create duplicate markdown" "1" "$(find "$LEGACY_EXISTING_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')"
+assert_eq "legacy existing does not create duplicate markdown" "1" "$(saved_markdown_count "$LEGACY_EXISTING_OBSIDIAN")"
 assert_contains "legacy existing appends Q2" "$LEGACY_EXISTING_OBSIDIAN/existing.md" "## Q2"
 assert_contains "legacy existing appends A2" "$LEGACY_EXISTING_OBSIDIAN/existing.md" "## A2"
 assert_contains "legacy existing appends answer" "$LEGACY_EXISTING_OBSIDIAN/existing.md" "legacy second answer"
@@ -922,7 +935,7 @@ else
 fi
 
 assert_eq "duplicate real recovery succeeds" "0" "$DUP_REAL_EXIT"
-assert_eq "duplicate real recovery writes two markdown files" "2" "$(find "$DUP_REAL_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')"
+assert_eq "duplicate real recovery writes two saved markdown files" "2" "$(saved_markdown_count "$DUP_REAL_OBSIDIAN")"
 DUP_PARENT_MD=$(grep -rl "parent transcript" "$DUP_REAL_OBSIDIAN" 2>/dev/null | head -1)
 DUP_CHILD_MD=$(grep -rl "child transcript" "$DUP_REAL_OBSIDIAN" 2>/dev/null | head -1)
 assert_file_exists "duplicate parent markdown is written" "$DUP_PARENT_MD"
@@ -984,7 +997,7 @@ else
 fi
 
 assert_eq "stale duplicate recovery succeeds" "0" "$STALE_DUP_EXIT"
-assert_eq "stale duplicate keeps bare plus child markdown" "2" "$(find "$STALE_DUP_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')"
+assert_eq "stale duplicate keeps bare plus child markdown" "2" "$(saved_markdown_count "$STALE_DUP_OBSIDIAN")"
 assert_contains "stale duplicate appends parent transcript" "$STALE_DUP_OBSIDIAN/existing.md" "stale duplicate parent second"
 STALE_DUP_CHILD_MD=$(grep -rl "stale duplicate child" "$STALE_DUP_OBSIDIAN" 2>/dev/null | head -1)
 assert_file_exists "stale duplicate child markdown is written" "$STALE_DUP_CHILD_MD"
@@ -1063,8 +1076,8 @@ else
 fi
 
 assert_eq "existing duplicate recovery succeeds" "0" "$EXISTING_DUP_EXIT"
-assert_eq "existing duplicate keeps one bare plus one child markdown" "2" "$(find "$EXISTING_DUP_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')"
-assert_eq "existing duplicate does not clone parent transcript" "1" "$(grep -rl "parent transcript" "$EXISTING_DUP_OBSIDIAN" 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "existing duplicate keeps one bare plus one child markdown" "2" "$(saved_markdown_count "$EXISTING_DUP_OBSIDIAN")"
+assert_eq "existing duplicate does not clone parent transcript" "1" "$(saved_grep_count "parent transcript" "$EXISTING_DUP_OBSIDIAN")"
 EXISTING_DUP_CHILD_MD=$(grep -rl "child transcript" "$EXISTING_DUP_OBSIDIAN" 2>/dev/null | head -1)
 assert_file_exists "existing duplicate child markdown is written" "$EXISTING_DUP_CHILD_MD"
 assert_contains "existing duplicate bare note remains bare" "$EXISTING_DUP_OBSIDIAN/existing.md" "session_id: \"shared-session\""
@@ -1139,9 +1152,9 @@ else
 fi
 
 assert_eq "single duplicate recovery succeeds" "0" "$SINGLE_DUP_EXIT"
-assert_eq "single duplicate keeps bare plus child markdown" "2" "$(find "$SINGLE_DUP_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')"
-assert_eq "single duplicate does not clone parent transcript" "1" "$(grep -rl "single parent transcript" "$SINGLE_DUP_OBSIDIAN" 2>/dev/null | wc -l | tr -d ' ')"
-assert_eq "single duplicate writes child transcript once" "1" "$(grep -rl "single child transcript" "$SINGLE_DUP_OBSIDIAN" 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "single duplicate keeps bare plus child markdown" "2" "$(saved_markdown_count "$SINGLE_DUP_OBSIDIAN")"
+assert_eq "single duplicate does not clone parent transcript" "1" "$(saved_grep_count "single parent transcript" "$SINGLE_DUP_OBSIDIAN")"
+assert_eq "single duplicate writes child transcript once" "1" "$(saved_grep_count "single child transcript" "$SINGLE_DUP_OBSIDIAN")"
 SINGLE_DUP_CHILD_MD=$(grep -rl "single child transcript" "$SINGLE_DUP_OBSIDIAN" 2>/dev/null | head -1)
 assert_file_exists "single duplicate child markdown is written" "$SINGLE_DUP_CHILD_MD"
 assert_contains "single duplicate bare note remains bare" "$SINGLE_DUP_OBSIDIAN/existing.md" "session_id: \"shared-session\""
@@ -1219,9 +1232,9 @@ else
 fi
 
 assert_eq "existing match recovery succeeds" "0" "$EXISTING_MATCH_EXIT"
-assert_eq "existing match keeps one bare plus one new markdown" "2" "$(find "$EXISTING_MATCH_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')"
-assert_eq "existing match does not clone matched bare transcript" "1" "$(grep -rl "orphan B transcript" "$EXISTING_MATCH_OBSIDIAN" 2>/dev/null | wc -l | tr -d ' ')"
-assert_eq "existing match writes unmatched transcript once" "1" "$(grep -rl "orphan A transcript" "$EXISTING_MATCH_OBSIDIAN" 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "existing match keeps one bare plus one new markdown" "2" "$(saved_markdown_count "$EXISTING_MATCH_OBSIDIAN")"
+assert_eq "existing match does not clone matched bare transcript" "1" "$(saved_grep_count "orphan B transcript" "$EXISTING_MATCH_OBSIDIAN")"
+assert_eq "existing match writes unmatched transcript once" "1" "$(saved_grep_count "orphan A transcript" "$EXISTING_MATCH_OBSIDIAN")"
 EXISTING_MATCH_A_MD=$(grep -rl "orphan A transcript" "$EXISTING_MATCH_OBSIDIAN" 2>/dev/null | head -1)
 assert_file_exists "existing match unmatched markdown is written" "$EXISTING_MATCH_A_MD"
 assert_contains "existing match bare note remains bare" "$EXISTING_MATCH_OBSIDIAN/existing.md" "session_id: \"shared-session\""
@@ -1297,7 +1310,7 @@ else
 fi
 
 assert_eq "redacted existing match recovery succeeds" "0" "$REDACTED_MATCH_EXIT"
-assert_eq "redacted existing match does not create duplicate markdown" "1" "$(find "$REDACTED_MATCH_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')"
+assert_eq "redacted existing match does not create duplicate markdown" "1" "$(saved_markdown_count "$REDACTED_MATCH_OBSIDIAN")"
 assert_contains "redacted existing match remains bare" "$REDACTED_MATCH_OBSIDIAN/existing.md" "session_id: \"redacted-session\""
 assert_not_contains "redacted existing match does not write raw secret" "$REDACTED_MATCH_OBSIDIAN/existing.md" "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJK"
 assert_contains "redacted existing match stores bare path" "$REDACTED_MATCH_STATE_DIR/daily-recovery.json" "redacted-session.jsonl"
@@ -1377,7 +1390,7 @@ else
 fi
 
 assert_eq "unredacted existing match recovery succeeds" "0" "$UNREDACTED_MATCH_EXIT"
-assert_eq "unredacted existing match does not create duplicate markdown" "1" "$(find "$UNREDACTED_MATCH_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')"
+assert_eq "unredacted existing match does not create duplicate markdown" "1" "$(saved_markdown_count "$UNREDACTED_MATCH_OBSIDIAN")"
 assert_contains "unredacted existing match remains bare" "$UNREDACTED_MATCH_OBSIDIAN/existing.md" "session_id: \"unredacted-session\""
 assert_contains "unredacted existing match appends answer" "$UNREDACTED_MATCH_OBSIDIAN/existing.md" "unredacted migrated answer"
 assert_contains "unredacted existing match migrates secret" "$UNREDACTED_MATCH_OBSIDIAN/existing.md" "[REDACTED_API_KEY]"
@@ -1427,7 +1440,7 @@ else
 fi
 
 assert_eq "duplicate normal recovery succeeds" "0" "$DUP_NORMAL_EXIT"
-assert_eq "duplicate normal recovery writes two markdown files" "2" "$(find "$DUP_NORMAL_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')"
+assert_eq "duplicate normal recovery writes two saved markdown files" "2" "$(saved_markdown_count "$DUP_NORMAL_OBSIDIAN")"
 DUP_NORMAL_A_MD=$(grep -rl "normal parent a" "$DUP_NORMAL_OBSIDIAN" 2>/dev/null | head -1)
 DUP_NORMAL_B_MD=$(grep -rl "normal parent b" "$DUP_NORMAL_OBSIDIAN" 2>/dev/null | head -1)
 assert_file_exists "duplicate normal first markdown is written" "$DUP_NORMAL_A_MD"
@@ -1499,9 +1512,9 @@ fi
 
 assert_eq "stable duplicate first recovery succeeds" "0" "$STABLE_DUP_FIRST_EXIT"
 assert_eq "stable duplicate second recovery succeeds" "0" "$STABLE_DUP_SECOND_EXIT"
-assert_eq "stable duplicate writes bare plus new path markdown" "2" "$(find "$STABLE_DUP_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')"
-assert_eq "stable duplicate does not clone previous bare transcript" "1" "$(grep -rl "stable B only" "$STABLE_DUP_OBSIDIAN" 2>/dev/null | wc -l | tr -d ' ')"
-assert_eq "stable duplicate writes new transcript once" "1" "$(grep -rl "stable A only" "$STABLE_DUP_OBSIDIAN" 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "stable duplicate writes bare plus new path markdown" "2" "$(saved_markdown_count "$STABLE_DUP_OBSIDIAN")"
+assert_eq "stable duplicate does not clone previous bare transcript" "1" "$(saved_grep_count "stable B only" "$STABLE_DUP_OBSIDIAN")"
+assert_eq "stable duplicate writes new transcript once" "1" "$(saved_grep_count "stable A only" "$STABLE_DUP_OBSIDIAN")"
 STABLE_DUP_B_MD=$(grep -rl "stable B only" "$STABLE_DUP_OBSIDIAN" 2>/dev/null | head -1)
 STABLE_DUP_A_MD=$(grep -rl "stable A only" "$STABLE_DUP_OBSIDIAN" 2>/dev/null | head -1)
 assert_contains "stable duplicate previous bare stays bare" "$STABLE_DUP_B_MD" "session_id: \"stable-session\""
@@ -1572,9 +1585,9 @@ fi
 
 assert_eq "path-stable first recovery succeeds" "0" "$PATH_STABLE_FIRST_EXIT"
 assert_eq "path-stable second recovery succeeds" "0" "$PATH_STABLE_SECOND_EXIT"
-assert_eq "path-stable keeps original two path markdown files" "2" "$(find "$PATH_STABLE_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')"
+assert_eq "path-stable keeps original two saved markdown files" "2" "$(saved_markdown_count "$PATH_STABLE_OBSIDIAN")"
 assert_eq "path-stable never creates a bare duplicate" "0" "$(grep -rl "session_id: \"path-stable-session\"" "$PATH_STABLE_OBSIDIAN" 2>/dev/null | wc -l | tr -d ' ')"
-assert_eq "path-stable remaining transcript is not cloned" "1" "$(grep -rl "path stable B" "$PATH_STABLE_OBSIDIAN" 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "path-stable remaining transcript is not cloned" "1" "$(saved_grep_count "path stable B" "$PATH_STABLE_OBSIDIAN")"
 
 echo ""
 echo "=== Claude JSONL existing bare match scans beyond hook noise ==="
@@ -1657,9 +1670,9 @@ else
 fi
 
 assert_eq "long match recovery succeeds" "0" "$LONG_MATCH_EXIT"
-assert_eq "long match does not create duplicate markdown" "1" "$(find "$LONG_MATCH_OBSIDIAN" -name '*.md' -type f | wc -l | tr -d ' ')"
+assert_eq "long match does not create duplicate markdown" "1" "$(saved_markdown_count "$LONG_MATCH_OBSIDIAN")"
 assert_contains "long match bare note remains bare" "$LONG_MATCH_OBSIDIAN/existing.md" "session_id: \"long-session\""
-assert_eq "long match second message remains single" "1" "$(grep -rl "long second" "$LONG_MATCH_OBSIDIAN" 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "long match second message remains single" "1" "$(saved_grep_count "long second" "$LONG_MATCH_OBSIDIAN")"
 
 if find "$REPO_DIR/scripts" -maxdepth 2 -type f -path '*/__pycache__/*' | grep -q .; then
     fail "daily recovery avoids pycache"

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import importlib.util
 import json
@@ -17,6 +18,7 @@ sys.dont_write_bytecode = True
 SCRIPT_DIR = Path(__file__).resolve().parent
 REDACTION_HELPER = Path(os.environ.get("REDACTION_HELPER", SCRIPT_DIR / "redact-secrets.py"))
 ENTRY_HEADING_RE = re.compile(r"^### (User|Assistant) \d+$")
+READABLE_GENERATOR_VERSION = "ai-log-readable-v1"
 DEFAULT_NOISE_PATTERN_TEXTS = (
     r"^\s*(?:#\s*)?(?:heartbeat|cron|checkpoint)\s+automation\s*:?\s*"
     r"(?:completed|started|finished|no changes|no-op|noop|checked|triggered|"
@@ -31,6 +33,30 @@ DEFAULT_NOISE_PATTERN_TEXTS = (
     r"(?:completed|started|finished|no changes|no-op|noop|checked|triggered|"
     r"scheduled|idle sync|daily recovery|nothing to do)\b",
 )
+SYSTEM_CONTEXT_PREFIXES = (
+    "# AGENTS.md",
+    "<INSTRUCTIONS>",
+    "<environment_context>",
+    "<uploaded_file",
+    "This session is being continued from a previous conversation",
+)
+READABLE_CHATTER_TEXTS = {
+    "確認します。",
+    "確認する。",
+    "調べます。",
+    "調べる。",
+    "探します。",
+    "探す。",
+    "見ていきます。",
+    "見ていく。",
+    "進めます。",
+    "進める。",
+    "実装に入る。",
+    "テストを実行する。",
+    "テストを走らせる。",
+    "レビューを挟む。",
+    "差分を確認する。",
+}
 NOISE_STATUS_TEXT = (
     r"(?:completed|started|finished|no changes|no-op|noop|checked|triggered|"
     r"scheduled|idle sync|daily recovery|nothing to do)"
@@ -197,6 +223,8 @@ def is_noise_message(value: str) -> bool:
         return False
     normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not normalized:
+        return True
+    if any(normalized.startswith(prefix) for prefix in SYSTEM_CONTEXT_PREFIXES):
         return True
     if is_noise_xml_block(normalized):
         return True
@@ -500,6 +528,94 @@ def filter_messages(args: argparse.Namespace) -> int:
     return 0
 
 
+def generated_at_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def is_readable_chatter_message(message: dict) -> bool:
+    if message.get("role") != "assistant":
+        return False
+    text = str(message.get("text", "")).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if "\n" in text or len(text) > 80:
+        return False
+    return text in READABLE_CHATTER_TEXTS
+
+
+def flush_omission_marker(entries: list[str], omitted_run: int) -> int:
+    if omitted_run > 0:
+        entries.append(f"(省略 {omitted_run} 件)\n")
+    return 0
+
+
+def format_readable_entries(messages: list[dict]) -> tuple[str, int, int]:
+    entries: list[str] = []
+    user_count = 0
+    assistant_count = 0
+    omitted_count = 0
+    omitted_run = 0
+
+    for message in messages:
+        omitted = bool(message.get("omitted")) or is_readable_chatter_message(message)
+        if omitted:
+            omitted_count += 1
+            omitted_run += 1
+            continue
+
+        omitted_run = flush_omission_marker(entries, omitted_run)
+        if message["role"] == "user":
+            user_count += 1
+            heading = f"### User {user_count}"
+        else:
+            assistant_count += 1
+            heading = f"### Assistant {assistant_count}"
+        entries.append(f"{heading}\n\n{escape_transcript_text(message['text']).rstrip()}\n")
+
+    flush_omission_marker(entries, omitted_run)
+    kept_count = user_count + assistant_count
+    return normalize_transcript("\n".join(entries)), kept_count, omitted_count
+
+
+def render_readable_record(args: argparse.Namespace) -> int:
+    all_messages, _kept_messages, writer_omitted_count = load_message_sets()
+    conversation, kept_count, readable_omitted_count = format_readable_entries(all_messages)
+    total_omitted_count = max(readable_omitted_count, writer_omitted_count) + args.omitted_msg_count
+    title = redact_text(args.title).replace("\n", " ").replace("\r", "").strip() or "untitled"
+    tags = args.tag or []
+    for tag in ("ai-log", "ai-log-readable"):
+        if tag not in tags:
+            tags.append(tag)
+    generated_at = args.generated_at or generated_at_now()
+
+    lines = [
+        "---\n",
+        f"date: {args.date}\n",
+        f"title: {yaml_quote(title)}\n",
+        f"source: {yaml_quote(args.source)}\n",
+        f"raw_ref: {yaml_quote(args.raw_ref)}\n",
+        f"raw_session_id: {yaml_quote(args.raw_session_id)}\n",
+        f"record_kind: {yaml_quote(args.record_kind)}\n",
+        f"msg_count: {kept_count}\n",
+        *([f"omitted_msg_count: {total_omitted_count}\n"] if total_omitted_count > 0 else []),
+        f"raw_hash: {yaml_quote(args.raw_hash)}\n",
+        f"generated_at: {yaml_quote(generated_at)}\n",
+        f"generator_version: {yaml_quote(args.generator_version)}\n",
+        *render_tags(tags),
+        "---\n",
+        "\n",
+        f"# {title}\n",
+        "\n",
+        "## Conversation\n",
+        "\n",
+        conversation,
+        "\n",
+        "## Raw\n",
+        "\n",
+        f"- {args.raw_ref}\n",
+    ]
+    sys.stdout.write("".join(lines))
+    return 0
+
+
 def render_existing_update(
     prefix: str,
     frontmatter: dict[str, str],
@@ -710,15 +826,6 @@ def create_record(args: argparse.Namespace) -> int:
         "\n",
         f"# {title}\n",
         "\n",
-        "## Summary\n",
-        "\n",
-        "\n",
-        "## Decisions\n",
-        "\n",
-        "\n",
-        "## Next Actions\n",
-        "\n",
-        "\n",
         "## Transcript\n",
         "\n",
         transcript,
@@ -835,6 +942,20 @@ def main() -> int:
     filter_parser = subparsers.add_parser("filter")
     filter_parser.add_argument("--include-omitted", action="store_true")
     filter_parser.set_defaults(func=filter_messages)
+
+    readable = subparsers.add_parser("readable")
+    readable.add_argument("--date", required=True)
+    readable.add_argument("--title", required=True)
+    readable.add_argument("--source", required=True)
+    readable.add_argument("--raw-session-id", required=True)
+    readable.add_argument("--raw-ref", required=True)
+    readable.add_argument("--raw-hash", required=True)
+    readable.add_argument("--record-kind", required=True)
+    readable.add_argument("--omitted-msg-count", type=int, default=0)
+    readable.add_argument("--generated-at", default="")
+    readable.add_argument("--generator-version", default=READABLE_GENERATOR_VERSION)
+    readable.add_argument("--tag", action="append", default=[])
+    readable.set_defaults(func=render_readable_record)
 
     args = parser.parse_args()
     return args.func(args)

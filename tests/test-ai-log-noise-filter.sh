@@ -7,6 +7,8 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 WRITER="$REPO_DIR/scripts/ai-log-writer.py"
 RECALL_SCRIPT="$REPO_DIR/scripts/sync-recall-to-obsidian.sh"
 CODEX_SCRIPT="$REPO_DIR/scripts/sync-codex-to-obsidian.sh"
+SEARCH_SCRIPT="$REPO_DIR/scripts/search-second-brain.sh"
+ARCHIVE_PLAN_SCRIPT="$REPO_DIR/scripts/plan-root-ai-log-archive.py"
 TEST_DIR=$(mktemp -d /tmp/test-ai-log-noise-filter-XXXXXX)
 PASS=0
 FAIL=0
@@ -65,7 +67,45 @@ assert_file_count() {
 }
 
 markdown_count() {
-    find "$1" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' '
+    find "$1" -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
+raw_markdown_by_session_id() {
+    local root="$1" sid="$2"
+    find "$root/AI-Logs/raw" -name '*.md' -type f -print0 2>/dev/null | \
+        xargs -0 grep -l "session_id: \"$sid\"" 2>/dev/null | head -1 || true
+}
+
+assert_readable_matches_raw() {
+    local label="$1" root="$2" raw_file="$3"
+    local expected
+    expected=$(python3 - "$root" "$raw_file" <<'PY'
+import hashlib
+import os
+import sys
+
+root, raw_file = sys.argv[1:3]
+rel = os.path.relpath(os.path.realpath(raw_file), os.path.realpath(root)).replace(os.sep, "/")
+stem = rel[:-3] if rel.endswith(".md") else rel
+readable_rel = "AI-Logs/readable/" + stem[len("AI-Logs/raw/"):] + ".md"
+digest = "sha256:" + hashlib.sha256(open(raw_file, "rb").read()).hexdigest()
+print(os.path.join(root, *readable_rel.split("/")))
+print(f'raw_ref: "[[{stem}]]"')
+print(f'raw_hash: "{digest}"')
+PY
+)
+    local readable_file raw_ref_line raw_hash_line
+    readable_file=$(printf '%s\n' "$expected" | sed -n '1p')
+    raw_ref_line=$(printf '%s\n' "$expected" | sed -n '2p')
+    raw_hash_line=$(printf '%s\n' "$expected" | sed -n '3p')
+    if [ -f "$readable_file" ]; then
+        pass "$label readable exists"
+    else
+        fail "$label readable exists (missing: $readable_file)"
+        return
+    fi
+    assert_file_contains "$label raw_ref matches raw path" "$readable_file" "$raw_ref_line"
+    assert_file_contains "$label raw_hash matches raw bytes" "$readable_file" "$raw_hash_line"
 }
 
 json_value() {
@@ -81,6 +121,145 @@ for part in expression.split("."):
 print(value)
 PY
 }
+
+echo ""
+echo "=== Root archive dry-run ==="
+
+ARCHIVE_NOTES="$TEST_DIR/archive-notes"
+mkdir -p "$ARCHIVE_NOTES/AI-Logs/raw/codex/2026-06"
+cat > "$ARCHIVE_NOTES/2026-06-03_codex_example.md" <<'MD'
+---
+date: 2026-06-03
+title: "Codex\tExample"
+source: "Codex"
+session_id: "archive-codex"
+tags:
+  - "ai-log"
+---
+
+# Codex Example
+
+## Transcript
+
+### User 1
+
+archive me
+MD
+printf 'not a generated log\n' > "$ARCHIVE_NOTES/README.md"
+cat > "$ARCHIVE_NOTES/2026-06-03_human_note.md" <<'MD'
+---
+date: 2026-06-03
+title: "Human note"
+---
+
+# Human note
+MD
+cat > "$ARCHIVE_NOTES/2026-06-03_no_transcript.md" <<'MD'
+---
+date: 2026-06-03
+title: "No transcript"
+source: "Codex"
+session_id: "not-ai-log-enough"
+---
+
+# No transcript
+MD
+printf 'raw should be ignored\n' > "$ARCHIVE_NOTES/AI-Logs/raw/codex/2026-06/raw.md"
+ARCHIVE_JSONL="$TEST_DIR/archive-plan.jsonl"
+SECOND_BRAIN_DIR="$ARCHIVE_NOTES" "$ARCHIVE_PLAN_SCRIPT" --progress-every 1 > "$ARCHIVE_JSONL" 2>"$TEST_DIR/archive-plan.err"
+assert_eq "archive dry-run finds one root candidate" "1" "$(wc -l < "$ARCHIVE_JSONL" | tr -d ' ')"
+assert_file_contains "archive dry-run targets raw-archive codex" "$ARCHIVE_JSONL" "\"target\": \"$ARCHIVE_NOTES/AI-Logs/raw-archive/codex/2026-06/2026-06-03_codex_example.md\""
+assert_file_contains "archive dry-run keeps session id" "$ARCHIVE_JSONL" "\"session_id\": \"archive-codex\""
+assert_file_not_contains "archive dry-run ignores human date note" "$ARCHIVE_JSONL" "human_note"
+assert_file_not_contains "archive dry-run ignores note without transcript" "$ARCHIVE_JSONL" "no_transcript"
+assert_file_not_contains "archive dry-run ignores nested raw" "$ARCHIVE_JSONL" "raw should be ignored"
+assert_file_contains "archive dry-run reports progress" "$TEST_DIR/archive-plan.err" "progress scanned="
+assert_file_contains "archive dry-run reports count" "$TEST_DIR/archive-plan.err" "planned_archive_candidates=1"
+assert_file_contains "archive dry-run reports scanned total" "$TEST_DIR/archive-plan.err" "archive_scan_summary scanned=4"
+assert_file_contains "archive dry-run reports no-date skips" "$TEST_DIR/archive-plan.err" "skipped.no_date_prefix=1"
+assert_file_contains "archive dry-run reports dataless skips" "$TEST_DIR/archive-plan.err" "skipped.icloud_dataless=0"
+assert_file_contains "archive dry-run reports no-session skips" "$TEST_DIR/archive-plan.err" "skipped.no_session_id=1"
+assert_file_contains "archive dry-run reports no-transcript skips" "$TEST_DIR/archive-plan.err" "skipped.no_transcript_marker=1"
+assert_file_contains "archive dry-run reports candidates total" "$TEST_DIR/archive-plan.err" "candidates=1"
+ARCHIVE_TSV="$TEST_DIR/archive-plan.tsv"
+SECOND_BRAIN_DIR="$ARCHIVE_NOTES" "$ARCHIVE_PLAN_SCRIPT" --format tsv > "$ARCHIVE_TSV" 2>/dev/null
+assert_eq "archive TSV has one data row" "2" "$(wc -l < "$ARCHIVE_TSV" | tr -d ' ')"
+assert_eq "archive TSV keeps tabbed title in one field" "8" "$(python3 - "$ARCHIVE_TSV" <<'PY'
+import csv
+import sys
+
+rows = list(csv.reader(open(sys.argv[1], encoding="utf-8"), delimiter="\t"))
+print(len(rows[1]))
+PY
+)"
+assert_eq "archive planner detects dataless stat flag" "1 0 0" "$(python3 - "$ARCHIVE_PLAN_SCRIPT" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("archive_plan", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+original_stat = module.os.stat
+
+class StatResult:
+    def __init__(self, flags):
+        self.st_flags = flags
+
+def fake_stat(flags=0, raises=False):
+    def _stat(_path, follow_symlinks=False):
+        if raises:
+            raise OSError("stat failed")
+        return StatResult(flags)
+    return _stat
+
+try:
+    module.os.stat = fake_stat(module.SF_DATALESS)
+    dataless = "1" if module.is_icloud_dataless(Path("example.md")) else "0"
+    module.os.stat = fake_stat(0)
+    local = "1" if module.is_icloud_dataless(Path("example.md")) else "0"
+    module.os.stat = fake_stat(raises=True)
+    error = "1" if module.is_icloud_dataless(Path("example.md")) else "0"
+finally:
+    module.os.stat = original_stat
+
+print(" ".join([dataless, local, error]))
+PY
+)"
+
+echo ""
+echo "=== Search helper ==="
+
+SEARCH_NOTES="$TEST_DIR/search-notes"
+mkdir -p "$SEARCH_NOTES/AI-Logs/raw/codex/2026-06" \
+    "$SEARCH_NOTES/AI-Logs/raw-archive/codex/2026-06" \
+    "$SEARCH_NOTES/AI-Logs/readable/codex/2026-06"
+printf 'search-helper-needle raw\n' > "$SEARCH_NOTES/AI-Logs/raw/codex/2026-06/raw.md"
+printf 'search-helper-needle archive\n' > "$SEARCH_NOTES/AI-Logs/raw-archive/codex/2026-06/archive.md"
+printf 'search-helper-needle readable\n' > "$SEARCH_NOTES/AI-Logs/readable/codex/2026-06/readable.md"
+SEARCH_OUTPUT=$(SECOND_BRAIN_DIR="$SEARCH_NOTES" "$SEARCH_SCRIPT" "search-helper-needle")
+assert_eq "search helper returns only readable match" "1" "$(printf '%s\n' "$SEARCH_OUTPUT" | grep -c 'search-helper-needle')"
+assert_text_contains() {
+    local label="$1" text="$2" pattern="$3"
+    if printf '%s' "$text" | grep -Fq "$pattern"; then
+        pass "$label"
+    else
+        fail "$label (missing pattern: $pattern)"
+    fi
+}
+assert_text_not_contains() {
+    local label="$1" text="$2" pattern="$3"
+    if printf '%s' "$text" | grep -Fq "$pattern"; then
+        fail "$label (unexpected pattern: $pattern)"
+    else
+        pass "$label"
+    fi
+}
+assert_text_contains "search helper includes readable" "$SEARCH_OUTPUT" "readable"
+assert_text_not_contains "search helper excludes raw" "$SEARCH_OUTPUT" " raw"
+assert_text_not_contains "search helper excludes archive" "$SEARCH_OUTPUT" "archive"
 
 echo ""
 echo "=== Writer filter ==="
@@ -412,9 +591,10 @@ REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
 AI_LOG_WRITER="$WRITER" \
     "$RECALL_SCRIPT" "claude-ordinary"
 
-assert_eq "ordinary claude discussion creates markdown" "1" "$(markdown_count "$TEST_DIR/claude-notes")"
-CLAUDE_MD=$(find "$TEST_DIR/claude-notes" -maxdepth 1 -name '*.md' -type f | head -1)
+assert_eq "ordinary claude discussion creates raw and readable markdown" "2" "$(markdown_count "$TEST_DIR/claude-notes")"
+CLAUDE_MD=$(raw_markdown_by_session_id "$TEST_DIR/claude-notes" "claude-ordinary")
 assert_file_contains "ordinary claude discussion is preserved" "$CLAUDE_MD" "cronとheartbeatの保存方針を相談したい"
+assert_readable_matches_raw "ordinary claude discussion" "$TEST_DIR/claude-notes" "$CLAUDE_MD"
 
 echo ""
 echo "=== Codex sync all-filtered session ==="
@@ -435,6 +615,25 @@ AI_LOG_WRITER="$WRITER" \
     "$CODEX_SCRIPT" "$CODEX_JSONL"
 
 assert_eq "all-filtered codex session creates no markdown" "0" "$(markdown_count "$TEST_DIR/codex-notes")"
+
+CODEX_ORDINARY_JSONL="$TEST_DIR/codex-sessions/ordinary.jsonl"
+CODEX_ORDINARY_SID="123e4567-e89b-12d3-a456-426614174112"
+cat > "$CODEX_ORDINARY_JSONL" <<JSONL
+{"type":"session_meta","timestamp":"2026-06-03T10:05:00Z","payload":{"id":"$CODEX_ORDINARY_SID","timestamp":"2026-06-03T10:05:00Z"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"codex ordinary task"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"codex ordinary answer"}]}}
+JSONL
+
+HOME="$TEST_DIR/home" \
+SECOND_BRAIN_DIR="$TEST_DIR/codex-notes" \
+CODEX_SESSIONS_DIR="$TEST_DIR/codex-sessions" \
+REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
+AI_LOG_WRITER="$WRITER" \
+    "$CODEX_SCRIPT" "$CODEX_ORDINARY_JSONL"
+
+CODEX_ORDINARY_MD=$(raw_markdown_by_session_id "$TEST_DIR/codex-notes" "$CODEX_ORDINARY_SID")
+assert_file_contains "ordinary codex discussion is preserved" "$CODEX_ORDINARY_MD" "codex ordinary task"
+assert_readable_matches_raw "ordinary codex discussion" "$TEST_DIR/codex-notes" "$CODEX_ORDINARY_MD"
 
 echo ""
 echo "=== Codex sync legacy noisy append ==="

@@ -42,6 +42,12 @@ assert_file_exists() {
     fi
 }
 
+find_raw_by_session_id() {
+    local sid="$1"
+    find "$TEST_DIR/obsidian/AI-Logs/raw" -name '*.md' -type f -print0 2>/dev/null | \
+        xargs -0 grep -l "session_id: \"$sid\"" 2>/dev/null | head -1 || true
+}
+
 assert_file_contains() {
     local label="$1" file="$2" pattern="$3"
     if grep -qE "$pattern" "$file" 2>/dev/null; then
@@ -114,12 +120,12 @@ rm -rf "$TEST_DIR/lock" 2>/dev/null
 bash "$TEST_SCRIPT" "test-new-session-0001" 2>&1 && EXIT_CODE=0 || EXIT_CODE=$?
 
 assert_eq "exit code is 0" "0" "$EXIT_CODE"
-assert_file_exists "ファイルが生成された" "2026-02-10_*_test-new.md"
+assert_file_exists "raw ファイルが生成された" "test-new-session-0001.md"
 
-GENERATED=$(find "$TEST_DIR/obsidian" -name "2026-02-10_*.md" | head -1)
+GENERATED=$(find_raw_by_session_id "test-new-session-0001")
 if [ -n "$GENERATED" ]; then
     assert_file_contains "session_id が含まれる" "$GENERATED" "session_id: \"test-new-session-0001\""
-    assert_file_contains "Summary セクションが含まれる" "$GENERATED" "^## Summary"
+    assert_file_not_contains "空 Summary セクションを作らない" "$GENERATED" "^## Summary"
     assert_file_contains "Transcript セクションが含まれる" "$GENERATED" "^## Transcript"
     assert_file_contains "User 1 が含まれる" "$GENERATED" "^### User 1"
     assert_file_contains "Assistant 1 が含まれる" "$GENERATED" "^### Assistant 1"
@@ -398,7 +404,7 @@ bash "$TEST_SCRIPT" "test-multiline-001" 2>&1 && EXIT_CODE7=0 || EXIT_CODE7=$?
 
 assert_eq "exit code is 0" "0" "$EXIT_CODE7"
 
-ML_FILE=$(find "$TEST_DIR/obsidian" -name "2026-02-11_*.md" | head -1)
+ML_FILE=$(find_raw_by_session_id "test-multiline-001")
 if [ -n "$ML_FILE" ]; then
     assert_file_contains "2行目が含まれる" "$ML_FILE" "2行目のテスト"
     assert_file_contains "3行目が含まれる" "$ML_FILE" "3行目のテスト"
@@ -455,6 +461,62 @@ if [ -n "$ML_FILE" ]; then
     assert_file_contains "追記A2の3行目が含まれる" "$ML_FILE" "追加回答の3行目"
 else
     echo "  ❌ マルチラインファイルが見つからない"
+    FAIL=$((FAIL + 1))
+fi
+
+# ========== Test 9: シンボリックリンク経由でもwriterを見失わない ==========
+echo ""
+echo "=== Test 9: シンボリックリンク経由の起動でもwriterを解決できる ==="
+
+SYMLINK_HOME="$TEST_DIR/symlink-home"
+SYMLINK_BIN="$TEST_DIR/symlink-bin"
+SYMLINK_OBSIDIAN="$TEST_DIR/symlink-obsidian"
+mkdir -p "$SYMLINK_HOME/.claude" "$SYMLINK_BIN" "$SYMLINK_OBSIDIAN"
+ln -s "$SCRIPT" "$SYMLINK_BIN/sync-recall-to-obsidian.sh"
+
+cat > "$TEST_DIR/symlink-session.json" << 'EOF'
+{
+  "session_id": "test-symlink-script-dir",
+  "source": "claude",
+  "cwd": "/tmp",
+  "timestamp": "2026-02-12T10:00:00Z",
+  "messages": [
+    {"role": "user", "content": "symlink 経由のテスト", "timestamp": "2026-02-12T10:00:00Z"},
+    {"role": "assistant", "content": "writer を見つけられます", "timestamp": "2026-02-12T10:00:01Z"}
+  ]
+}
+EOF
+
+cat > "$MOCK_BIN/recall" << MOCK_EOF
+#!/bin/bash
+if [ "\$1" = "read" ]; then
+    cat "$TEST_DIR/symlink-session.json"
+elif [ "\$1" = "list" ]; then
+    cat "$TEST_DIR/list.json"
+fi
+MOCK_EOF
+chmod +x "$MOCK_BIN/recall"
+
+rm -rf "$SYMLINK_HOME/.claude/recall-obsidian-sync.lock" 2>/dev/null
+
+(
+    cd "$TEST_DIR"
+    unset REDACTION_HELPER AI_LOG_WRITER
+    HOME="$SYMLINK_HOME" \
+    SECOND_BRAIN_DIR="$SYMLINK_OBSIDIAN" \
+    MOCK_RECALL_DATA="$TEST_DIR/symlink-session.json" \
+    PATH="$MOCK_BIN:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        "$SYMLINK_BIN/sync-recall-to-obsidian.sh" "test-symlink-script-dir"
+) 2> "$TEST_DIR/symlink.err" && EXIT_CODE9=0 || EXIT_CODE9=$?
+
+assert_eq "exit code is 0" "0" "$EXIT_CODE9"
+
+SYMLINK_FILE=$(find "$SYMLINK_OBSIDIAN/AI-Logs/raw" -name '*.md' -type f -print0 2>/dev/null | \
+    xargs -0 grep -l 'session_id: "test-symlink-script-dir"' 2>/dev/null | head -1 || true)
+if [ -n "$SYMLINK_FILE" ]; then
+    assert_file_contains "symlink 経由でもMarkdownが生成される" "$SYMLINK_FILE" "writer を見つけられます"
+else
+    echo "  ❌ symlink 経由のMarkdownが生成されなかった"
     FAIL=$((FAIL + 1))
 fi
 

@@ -5,13 +5,27 @@ set -euo pipefail
 
 umask 077
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    local dir
+    while [ -L "$source" ]; do
+        dir="$(cd -P "$(dirname "$source")" && pwd)"
+        source="$(readlink "$source")"
+        case "$source" in
+            /*) ;;
+            *) source="$dir/$source" ;;
+        esac
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_dir)"
 
 LOAD_JOBS=1
 LABEL_PREFIX="${AI_LAUNCHD_LABEL_PREFIX:-com.ai-second-brain}"
 LAUNCH_AGENTS_DIR="${AI_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 STATE_DIR="${AI_SECOND_BRAIN_STATE_DIR:-$HOME/.claude/ai-second-brain-state}"
-LAUNCHD_PATH="${AI_LAUNCHD_PATH:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
+LAUNCHD_PATH="${AI_LAUNCHD_PATH:-$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
 IDLE_INTERVAL_SECONDS="${AI_LAUNCHD_IDLE_INTERVAL_SECONDS:-600}"
 DAILY_HOUR="${AI_LAUNCHD_DAILY_HOUR:-5}"
 DAILY_MINUTE="${AI_LAUNCHD_DAILY_MINUTE:-0}"

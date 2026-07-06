@@ -61,6 +61,12 @@ assert_file_not_contains() {
     fi
 }
 
+raw_markdown_by_session_id() {
+    local root="$1" sid="$2"
+    find "$root/AI-Logs/raw" -name '*.md' -type f -print0 2>/dev/null | \
+        xargs -0 grep -l "session_id: \"$sid\"" 2>/dev/null | head -1 || true
+}
+
 echo "=== Helper redaction ==="
 
 private_key_block=$(printf '%s\n%s\n%s' \
@@ -853,7 +859,7 @@ python3 -c "
 from pathlib import Path
 path = Path('$SUMMARY_WRITER_MD')
 text = path.read_text(encoding='utf-8')
-text = text.replace('## Summary\n\n\n## Decisions', '## Summary\n\n## Transcript\n\nnot the transcript section\n\n## Decisions')
+text = text.replace('## Transcript\n\n', '## Notes\n\n## Transcript\n\nnot the transcript section\n\n## Transcript\n\n', 1)
 path.write_text(text, encoding='utf-8')
 "
 
@@ -1090,7 +1096,7 @@ export PATH="$MOCK_BIN:$PATH"
 export MOCK_RECALL_DATA="$REPO_DIR/tests/fixtures/claude-redaction-session.json"
 bash "$REPO_DIR/scripts/sync-recall-to-obsidian.sh" "redaction-claude-session"
 
-CLAUDE_MD=$(find "$SECOND_BRAIN_DIR" -name '*.md' -type f | head -1)
+CLAUDE_MD=$(raw_markdown_by_session_id "$SECOND_BRAIN_DIR" "redaction-claude-session")
 if [ -z "$CLAUDE_MD" ]; then
     fail "claude markdown was created"
 else
@@ -1127,7 +1133,7 @@ mkdir -p "$HOME/.claude" "$SECOND_BRAIN_DIR" "$CODEX_SESSIONS_DIR"
 cp "$REPO_DIR/tests/fixtures/codex-redaction-rollout.jsonl" "$CODEX_SESSIONS_DIR/rollout-redaction.jsonl"
 bash "$REPO_DIR/scripts/sync-codex-to-obsidian.sh"
 
-CODEX_MD=$(find "$SECOND_BRAIN_DIR" -name '*.md' -type f | head -1)
+CODEX_MD=$(raw_markdown_by_session_id "$SECOND_BRAIN_DIR" "123e4567-e89b-12d3-a456-426614174000")
 if [ -z "$CODEX_MD" ]; then
     fail "codex markdown was created"
 else
@@ -1173,7 +1179,7 @@ EOF
 
 bash "$REPO_DIR/scripts/sync-codex-to-obsidian.sh" "$CODEX_SESSIONS_DIR/manual-session.jsonl"
 
-SINGLE_CODEX_MD=$(find "$SECOND_BRAIN_DIR" -name '*.md' -type f | head -1)
+SINGLE_CODEX_MD=$(raw_markdown_by_session_id "$SECOND_BRAIN_DIR" "123e4567-e89b-12d3-a456-426614174000")
 if [ -z "$SINGLE_CODEX_MD" ]; then
     fail "codex single markdown was created"
 else
@@ -1273,7 +1279,7 @@ EOF
 
 bash "$REPO_DIR/scripts/sync-codex-to-obsidian.sh"
 
-DASH_MD=$(find "$SECOND_BRAIN_DIR" -name '*.md' -type f | head -1)
+DASH_MD=$(raw_markdown_by_session_id "$SECOND_BRAIN_DIR" "$DASH_SID")
 if [ -z "$DASH_MD" ]; then
     fail "codex dash title markdown was created"
 else

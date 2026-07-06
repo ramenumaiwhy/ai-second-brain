@@ -5,7 +5,21 @@ set -euo pipefail
 
 umask 077
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    local dir
+    while [ -L "$source" ]; do
+        dir="$(cd -P "$(dirname "$source")" && pwd)"
+        source="$(readlink "$source")"
+        case "$source" in
+            /*) ;;
+            *) source="$dir/$source" ;;
+        esac
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_dir)"
 
 STATE_DIR="${AI_SECOND_BRAIN_STATE_DIR:-$HOME/.claude/ai-second-brain-state}"
 STATE_FILE="$STATE_DIR/daily-recovery.json"
@@ -485,9 +499,49 @@ def existing_bare_markdown_path(session_id: str) -> Path | None:
     try:
         if second_brain_dir.is_symlink() or not second_brain_dir.is_dir():
             return None
-        paths = sorted(path for path in second_brain_dir.iterdir() if path.suffix == ".md")
     except OSError:
         return None
+    search_roots = [
+        (second_brain_dir / "AI-Logs" / "raw", True),
+        (second_brain_dir / "AI-Logs" / "raw-archive", True),
+        (second_brain_dir, False),
+    ]
+    seen: set[Path] = set()
+    paths: list[Path] = []
+    for root, recursive in search_roots:
+        if not root.exists() or root.is_symlink() or not root.is_dir():
+            continue
+        root_paths: list[Path] = []
+        if not recursive:
+            try:
+                direct_paths = [path for path in root.iterdir() if path.suffix == ".md"]
+            except OSError:
+                direct_paths = []
+            for path in direct_paths:
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                root_paths.append(path)
+            paths.extend(sorted(root_paths))
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                dirname
+                for dirname in dirnames
+                if not os.path.islink(os.path.join(dirpath, dirname))
+                and Path(dirpath, dirname).resolve() != (second_brain_dir / "AI-Logs" / "readable").resolve()
+            ]
+            for filename in filenames:
+                if not filename.endswith(".md"):
+                    continue
+                path = Path(dirpath) / filename
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                root_paths.append(path)
+        paths.extend(sorted(root_paths))
     for path in paths:
         try:
             if path.is_symlink() or not path.is_file():
