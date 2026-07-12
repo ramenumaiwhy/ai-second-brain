@@ -132,6 +132,32 @@ AI_SECOND_BRAIN_STATE_DIR="$STATE_DIR" \
 
 assert_json_session_exists "checkpoint reads session id from hook stdin" "claude:stdin-session-1"
 
+mkdir -p "$TEST_DIR/hook-codex-sessions"
+HOOK_CODEX_JSONL="$TEST_DIR/hook-codex-sessions/rollout-hook-session.jsonl"
+printf '%s\n' '{"type":"session_meta","payload":{"id":"hook-codex-session"}}' > "$HOOK_CODEX_JSONL"
+printf '{"session_id":"hook-codex-session","transcript_path":"%s","hook_event_name":"Stop"}' "$HOOK_CODEX_JSONL" | \
+AI_SECOND_BRAIN_STATE_DIR="$STATE_DIR" \
+CODEX_SESSIONS_DIR="$TEST_DIR/hook-codex-sessions" \
+    "$RECORD_SCRIPT" --source codex --session-id ""
+
+assert_json_session_exists "codex checkpoint reads hook session id" "codex:hook-codex-session"
+assert_eq "codex checkpoint keeps hook transcript path" "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$HOOK_CODEX_JSONL")" "$(python3 - "$STATE_FILE" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["sessions"]["codex:hook-codex-session"]["jsonl_path"])
+PY
+)"
+
+MISMATCH_CODEX_JSONL="$TEST_DIR/hook-codex-sessions/mismatch.jsonl"
+printf '%s\n' '{"type":"session_meta","payload":{"id":"actual-codex-session"}}' > "$MISMATCH_CODEX_JSONL"
+set +e
+AI_SECOND_BRAIN_STATE_DIR="$STATE_DIR" CODEX_SESSIONS_DIR="$TEST_DIR/hook-codex-sessions" \
+    "$RECORD_SCRIPT" --source codex --session-id expected-codex-session --path "$MISMATCH_CODEX_JSONL" >/dev/null 2>&1
+MISMATCH_EXIT=$?
+set -e
+assert_eq "codex checkpoint rejects mismatched session metadata" "2" "$MISMATCH_EXIT"
+assert_json_session_missing "mismatched codex checkpoint is not recorded" "codex:expected-codex-session"
+
 python3 - "$STATE_FILE" <<'PY'
 import json
 import sys
@@ -139,6 +165,7 @@ import sys
 path = sys.argv[1]
 data = json.load(open(path, encoding="utf-8"))
 data.get("sessions", {}).pop("claude:stdin-session-1", None)
+data.get("sessions", {}).pop("codex:hook-codex-session", None)
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(data, handle)
     handle.write("\n")
@@ -184,10 +211,11 @@ echo "=== Due Codex checkpoint ==="
 
 mkdir -p "$TEST_DIR/codex-sessions"
 CODEX_JSONL="$TEST_DIR/codex-sessions/session.jsonl"
-touch "$CODEX_JSONL"
+printf '%s\n' '{"type":"session_meta","payload":{"id":"codex-session-1"}}' > "$CODEX_JSONL"
 REAL_CODEX_JSONL=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$CODEX_JSONL")
 
 AI_SECOND_BRAIN_STATE_DIR="$STATE_DIR" \
+CODEX_SESSIONS_DIR="$TEST_DIR/codex-sessions" \
     "$RECORD_SCRIPT" --source codex --session-id codex-session-1 --path "$CODEX_JSONL"
 
 AI_SECOND_BRAIN_STATE_DIR="$STATE_DIR" \

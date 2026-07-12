@@ -8,6 +8,7 @@ WRITER="$REPO_DIR/scripts/ai-log-writer.py"
 RECALL_SCRIPT="$REPO_DIR/scripts/sync-recall-to-obsidian.sh"
 CODEX_SCRIPT="$REPO_DIR/scripts/sync-codex-to-obsidian.sh"
 SEARCH_SCRIPT="$REPO_DIR/scripts/search-second-brain.sh"
+SEARCH_LISTER="$REPO_DIR/scripts/list-searchable-second-brain.py"
 ARCHIVE_PLAN_SCRIPT="$REPO_DIR/scripts/plan-root-ai-log-archive.py"
 TEST_DIR=$(mktemp -d /tmp/test-ai-log-noise-filter-XXXXXX)
 PASS=0
@@ -76,6 +77,17 @@ raw_markdown_by_session_id() {
         xargs -0 grep -l "session_id: \"$sid\"" 2>/dev/null | head -1 || true
 }
 
+readable_markdown_for_raw() {
+    local root="$1" raw_file="$2"
+    python3 - "$root" "$raw_file" <<'PY'
+import os
+import sys
+root, raw_file = sys.argv[1:3]
+relative = os.path.relpath(os.path.realpath(raw_file), os.path.realpath(root)).replace(os.sep, "/")
+print(os.path.join(root, *("AI-Logs/readable/" + relative[len("AI-Logs/raw/"):]).split("/")))
+PY
+}
+
 assert_readable_matches_raw() {
     local label="$1" root="$2" raw_file="$3"
     local expected
@@ -106,6 +118,12 @@ PY
     fi
     assert_file_contains "$label raw_ref matches raw path" "$readable_file" "$raw_ref_line"
     assert_file_contains "$label raw_hash matches raw bytes" "$readable_file" "$raw_hash_line"
+}
+
+automation_markdown_by_session_id() {
+    local root="$1" sid="$2"
+    find "$root/AI-Logs/automation" -name '*.md' -type f -print0 2>/dev/null | \
+        xargs -0 grep -l "raw_session_id: \"$sid\"" 2>/dev/null | head -1 || true
 }
 
 json_value() {
@@ -235,12 +253,21 @@ echo "=== Search helper ==="
 SEARCH_NOTES="$TEST_DIR/search-notes"
 mkdir -p "$SEARCH_NOTES/AI-Logs/raw/codex/2026-06" \
     "$SEARCH_NOTES/AI-Logs/raw-archive/codex/2026-06" \
-    "$SEARCH_NOTES/AI-Logs/readable/codex/2026-06"
+    "$SEARCH_NOTES/AI-Logs/readable/codex/2026-06" \
+    "$SEARCH_NOTES/AI-Logs/automation/codex/2026-06" \
+    "$SEARCH_NOTES/OpenClaw/sources" \
+    "$SEARCH_NOTES/plans"
 printf 'search-helper-needle raw\n' > "$SEARCH_NOTES/AI-Logs/raw/codex/2026-06/raw.md"
 printf 'search-helper-needle archive\n' > "$SEARCH_NOTES/AI-Logs/raw-archive/codex/2026-06/archive.md"
 printf 'search-helper-needle readable\n' > "$SEARCH_NOTES/AI-Logs/readable/codex/2026-06/readable.md"
+printf 'search-helper-needle automation\n' > "$SEARCH_NOTES/AI-Logs/automation/codex/2026-06/automation.md"
+printf 'search-helper-needle legacy\n' > "$SEARCH_NOTES/2026-06-03_legacy.md"
+printf 'search-helper-needle root-human\n' > "$SEARCH_NOTES/README.md"
+printf 'search-helper-needle openclaw\n' > "$SEARCH_NOTES/OpenClaw/sources/result.md"
+printf 'search-helper-needle binary-like\n' > "$SEARCH_NOTES/OpenClaw/sources/result.bin"
+printf 'search-helper-needle plan\n' > "$SEARCH_NOTES/plans/plan.md"
 SEARCH_OUTPUT=$(SECOND_BRAIN_DIR="$SEARCH_NOTES" "$SEARCH_SCRIPT" "search-helper-needle")
-assert_eq "search helper returns only readable match" "1" "$(printf '%s\n' "$SEARCH_OUTPUT" | grep -c 'search-helper-needle')"
+assert_eq "search helper returns allowlisted matches" "4" "$(printf '%s\n' "$SEARCH_OUTPUT" | grep -c 'search-helper-needle')"
 assert_text_contains() {
     local label="$1" text="$2" pattern="$3"
     if printf '%s' "$text" | grep -Fq "$pattern"; then
@@ -258,8 +285,57 @@ assert_text_not_contains() {
     fi
 }
 assert_text_contains "search helper includes readable" "$SEARCH_OUTPUT" "readable"
+assert_text_contains "search helper includes root human note" "$SEARCH_OUTPUT" "root-human"
+assert_text_contains "search helper includes OpenClaw" "$SEARCH_OUTPUT" "openclaw"
+assert_text_contains "search helper includes plans" "$SEARCH_OUTPUT" "plan"
 assert_text_not_contains "search helper excludes raw" "$SEARCH_OUTPUT" " raw"
 assert_text_not_contains "search helper excludes archive" "$SEARCH_OUTPUT" "archive"
+assert_text_not_contains "search helper excludes automation" "$SEARCH_OUTPUT" "automation"
+assert_text_not_contains "search helper excludes dated root legacy" "$SEARCH_OUTPUT" "legacy"
+assert_text_not_contains "search helper excludes non-Markdown files" "$SEARCH_OUTPUT" "binary-like"
+set +e
+SECOND_BRAIN_DIR="$SEARCH_NOTES" "$SEARCH_SCRIPT" "definitely-not-present" >/dev/null 2>&1
+SEARCH_NO_MATCH_EXIT=$?
+SECOND_BRAIN_DIR="$SEARCH_NOTES" "$SEARCH_SCRIPT" --definitely-invalid >/dev/null 2>&1
+SEARCH_INVALID_EXIT=$?
+set -e
+assert_eq "search helper preserves rg no-match exit" "1" "$SEARCH_NO_MATCH_EXIT"
+assert_eq "search helper preserves rg argument error exit" "2" "$SEARCH_INVALID_EXIT"
+assert_eq "search lister detects dataless stat flag" "1 0 1" "$(python3 - "$SEARCH_LISTER" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("search_list", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+original_stat = module.os.stat
+
+class StatResult:
+    def __init__(self, flags):
+        self.st_flags = flags
+
+def fake_stat(flags=0, raises=False):
+    def _stat(_path, follow_symlinks=False):
+        if raises:
+            raise OSError("stat failed")
+        return StatResult(flags)
+    return _stat
+
+try:
+    module.os.stat = fake_stat(module.SF_DATALESS)
+    dataless = "1" if module.is_dataless(Path("example.md")) else "0"
+    module.os.stat = fake_stat(0)
+    local = "1" if module.is_dataless(Path("example.md")) else "0"
+    module.os.stat = fake_stat(raises=True)
+    error = "1" if module.is_dataless(Path("example.md")) else "0"
+finally:
+    module.os.stat = original_stat
+
+print(" ".join([dataless, local, error]))
+PY
+)"
 
 echo ""
 echo "=== Writer filter ==="
@@ -614,7 +690,12 @@ REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
 AI_LOG_WRITER="$WRITER" \
     "$CODEX_SCRIPT" "$CODEX_JSONL"
 
-assert_eq "all-filtered codex session creates no markdown" "0" "$(markdown_count "$TEST_DIR/codex-notes")"
+assert_eq "all-filtered codex session creates raw and readable markdown" "2" "$(markdown_count "$TEST_DIR/codex-notes")"
+CODEX_FILTERED_RAW=$(raw_markdown_by_session_id "$TEST_DIR/codex-notes" "123e4567-e89b-12d3-a456-426614174111")
+assert_file_contains "all-filtered raw preserves user message" "$CODEX_FILTERED_RAW" "[cron] no changes"
+assert_file_contains "all-filtered raw preserves assistant message" "$CODEX_FILTERED_RAW" "Heartbeat automation completed: no changes"
+assert_file_contains "all-filtered raw counts every message" "$CODEX_FILTERED_RAW" "msg_count: 2"
+assert_readable_matches_raw "all-filtered codex session" "$TEST_DIR/codex-notes" "$CODEX_FILTERED_RAW"
 
 CODEX_ORDINARY_JSONL="$TEST_DIR/codex-sessions/ordinary.jsonl"
 CODEX_ORDINARY_SID="123e4567-e89b-12d3-a456-426614174112"
@@ -634,6 +715,111 @@ AI_LOG_WRITER="$WRITER" \
 CODEX_ORDINARY_MD=$(raw_markdown_by_session_id "$TEST_DIR/codex-notes" "$CODEX_ORDINARY_SID")
 assert_file_contains "ordinary codex discussion is preserved" "$CODEX_ORDINARY_MD" "codex ordinary task"
 assert_readable_matches_raw "ordinary codex discussion" "$TEST_DIR/codex-notes" "$CODEX_ORDINARY_MD"
+
+echo ""
+echo "=== Codex automation classification ==="
+
+CODEX_AUTOMATION_JSONL="$TEST_DIR/codex-sessions/automation.jsonl"
+CODEX_AUTOMATION_SID="123e4567-e89b-12d3-a456-426614174113"
+cat > "$CODEX_AUTOMATION_JSONL" <<JSONL
+{"type":"session_meta","timestamp":"2026-06-03T10:10:00Z","payload":{"id":"$CODEX_AUTOMATION_SID","timestamp":"2026-06-03T10:10:00Z"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Automation: OpenClaw Gateway Health Check\nAutomation ID: openclaw-gateway-health-check\nAutomation memory: \$CODEX_HOME/automations/openclaw-gateway-health-check/memory.md\nLast run: 2026-06-03T10:00:00Z\n\nCheck gateway health."}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Gateway healthy."}]}}
+JSONL
+
+HOME="$TEST_DIR/home" \
+SECOND_BRAIN_DIR="$TEST_DIR/codex-notes" \
+CODEX_SESSIONS_DIR="$TEST_DIR/codex-sessions" \
+REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
+AI_LOG_WRITER="$WRITER" \
+    "$CODEX_SCRIPT" "$CODEX_AUTOMATION_JSONL"
+
+CODEX_AUTOMATION_RAW=$(raw_markdown_by_session_id "$TEST_DIR/codex-notes" "$CODEX_AUTOMATION_SID")
+CODEX_AUTOMATION_VIEW=$(automation_markdown_by_session_id "$TEST_DIR/codex-notes" "$CODEX_AUTOMATION_SID")
+assert_file_contains "automation raw has record kind" "$CODEX_AUTOMATION_RAW" 'record_kind: "automation"'
+assert_file_contains "automation raw has automation id" "$CODEX_AUTOMATION_RAW" 'automation_id: "openclaw-gateway-health-check"'
+assert_file_contains "automation raw has classification rule" "$CODEX_AUTOMATION_RAW" 'classification_rule: "codex-automation-envelope-v1"'
+assert_file_contains "automation derived view exists" "$CODEX_AUTOMATION_VIEW" 'record_kind: "automation"'
+assert_eq "automation is absent from readable" "0" "$(find "$TEST_DIR/codex-notes/AI-Logs/readable" -name '*.md' -type f -print0 2>/dev/null | xargs -0 grep -l "$CODEX_AUTOMATION_SID" 2>/dev/null | wc -l | tr -d ' ')"
+
+CODEX_AUTOMATION_QUOTE_JSONL="$TEST_DIR/codex-sessions/automation-quote.jsonl"
+CODEX_AUTOMATION_QUOTE_SID="123e4567-e89b-12d3-a456-426614174114"
+cat > "$CODEX_AUTOMATION_QUOTE_JSONL" <<JSONL
+{"type":"session_meta","timestamp":"2026-06-03T10:15:00Z","payload":{"id":"$CODEX_AUTOMATION_QUOTE_SID","timestamp":"2026-06-03T10:15:00Z"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Automation: OpenClaw Gateway Health Check というログについて相談したい"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"普通の相談として扱う。"}]}}
+JSONL
+
+HOME="$TEST_DIR/home" \
+SECOND_BRAIN_DIR="$TEST_DIR/codex-notes" \
+CODEX_SESSIONS_DIR="$TEST_DIR/codex-sessions" \
+REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
+AI_LOG_WRITER="$WRITER" \
+    "$CODEX_SCRIPT" "$CODEX_AUTOMATION_QUOTE_JSONL"
+
+CODEX_AUTOMATION_QUOTE_RAW=$(raw_markdown_by_session_id "$TEST_DIR/codex-notes" "$CODEX_AUTOMATION_QUOTE_SID")
+assert_file_contains "automation title quote remains interactive" "$CODEX_AUTOMATION_QUOTE_RAW" 'record_kind: "interactive"'
+assert_readable_matches_raw "automation title quote" "$TEST_DIR/codex-notes" "$CODEX_AUTOMATION_QUOTE_RAW"
+
+echo ""
+echo "=== Existing Codex raw reclassification ==="
+
+CODEX_RECLASSIFY_JSONL="$TEST_DIR/codex-sessions/reclassify.jsonl"
+CODEX_RECLASSIFY_SID="123e4567-e89b-12d3-a456-426614174115"
+cat > "$CODEX_RECLASSIFY_JSONL" <<JSONL
+{"type":"session_meta","timestamp":"2026-06-03T10:20:00Z","payload":{"id":"$CODEX_RECLASSIFY_SID","timestamp":"2026-06-03T10:20:00Z"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"ordinary task before classification"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ordinary answer"}]}}
+JSONL
+
+HOME="$TEST_DIR/home" SECOND_BRAIN_DIR="$TEST_DIR/codex-notes" CODEX_SESSIONS_DIR="$TEST_DIR/codex-sessions" \
+REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" AI_LOG_WRITER="$WRITER" \
+    "$CODEX_SCRIPT" "$CODEX_RECLASSIFY_JSONL"
+
+CODEX_RECLASSIFY_RAW=$(raw_markdown_by_session_id "$TEST_DIR/codex-notes" "$CODEX_RECLASSIFY_SID")
+CODEX_RECLASSIFY_READABLE=$(readable_markdown_for_raw "$TEST_DIR/codex-notes" "$CODEX_RECLASSIFY_RAW")
+assert_file_contains "reclassification fixture starts interactive" "$CODEX_RECLASSIFY_READABLE" 'record_kind: "interactive"'
+printf '\nuser-edited-derived-content\n' >> "$CODEX_RECLASSIFY_READABLE"
+
+cat > "$CODEX_RECLASSIFY_JSONL" <<JSONL
+{"type":"session_meta","timestamp":"2026-06-03T10:20:00Z","payload":{"id":"$CODEX_RECLASSIFY_SID","timestamp":"2026-06-03T10:20:00Z"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Automation: Reclassification Test\nAutomation ID: reclassification-test\nAutomation memory: \$CODEX_HOME/automations/reclassification-test/memory.md\nLast run: 2026-06-03T10:19:00Z\n\nRun the check."}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Automation answer"}]}}
+JSONL
+
+HOME="$TEST_DIR/home" SECOND_BRAIN_DIR="$TEST_DIR/codex-notes" CODEX_SESSIONS_DIR="$TEST_DIR/codex-sessions" \
+REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" AI_LOG_WRITER="$WRITER" \
+    "$CODEX_SCRIPT" "$CODEX_RECLASSIFY_JSONL"
+
+CODEX_RECLASSIFY_AUTOMATION=$(automation_markdown_by_session_id "$TEST_DIR/codex-notes" "$CODEX_RECLASSIFY_SID")
+assert_file_contains "existing raw is reclassified as automation" "$CODEX_RECLASSIFY_RAW" 'record_kind: "automation"'
+assert_file_contains "reclassified automation view is generated" "$CODEX_RECLASSIFY_AUTOMATION" 'automation_id: "reclassification-test"'
+assert_eq "stale readable is removed after verified reclassification" "0" "$(find "$TEST_DIR/codex-notes/AI-Logs/readable" -name '*.md' -type f -print0 2>/dev/null | xargs -0 grep -l "$CODEX_RECLASSIFY_SID" 2>/dev/null | wc -l | tr -d ' ')"
+CODEX_RECLASSIFY_BACKUP_DIR="$TEST_DIR/home/.claude/ai-second-brain-state/reclassified-derived/$CODEX_RECLASSIFY_SID"
+assert_eq "edited stale readable is backed up before retirement" "1" "$(find "$CODEX_RECLASSIFY_BACKUP_DIR" -name 'interactive-*.md' -type f 2>/dev/null | wc -l | tr -d ' ')"
+assert_file_contains "stale readable backup preserves user edits" "$(find "$CODEX_RECLASSIFY_BACKUP_DIR" -name 'interactive-*.md' -type f | head -1)" "user-edited-derived-content"
+
+cat > "$CODEX_RECLASSIFY_JSONL" <<JSONL
+{"type":"session_meta","timestamp":"2026-06-03T10:20:00Z","payload":{"id":"$CODEX_RECLASSIFY_SID","timestamp":"2026-06-03T10:20:00Z"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"ordinary task after classification"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ordinary answer again"}]}}
+JSONL
+
+HOME="$TEST_DIR/home" SECOND_BRAIN_DIR="$TEST_DIR/codex-notes" CODEX_SESSIONS_DIR="$TEST_DIR/codex-sessions" \
+REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" AI_LOG_WRITER="$WRITER" \
+    "$CODEX_SCRIPT" "$CODEX_RECLASSIFY_JSONL"
+
+CODEX_RECLASSIFY_READABLE=$(readable_markdown_for_raw "$TEST_DIR/codex-notes" "$CODEX_RECLASSIFY_RAW")
+assert_file_contains "existing raw can return to interactive" "$CODEX_RECLASSIFY_RAW" 'record_kind: "interactive"'
+assert_file_contains "interactive view is regenerated" "$CODEX_RECLASSIFY_READABLE" 'record_kind: "interactive"'
+assert_eq "stale automation is removed after verified reverse classification" "0" "$(find "$TEST_DIR/codex-notes/AI-Logs/automation" -name '*.md' -type f -print0 2>/dev/null | xargs -0 grep -l "$CODEX_RECLASSIFY_SID" 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "stale automation is backed up before retirement" "1" "$(find "$CODEX_RECLASSIFY_BACKUP_DIR" -name 'automation-*.md' -type f 2>/dev/null | wc -l | tr -d ' ')"
+
+rm "$CODEX_RECLASSIFY_READABLE"
+HOME="$TEST_DIR/home" SECOND_BRAIN_DIR="$TEST_DIR/codex-notes" CODEX_SESSIONS_DIR="$TEST_DIR/codex-sessions" \
+REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" AI_LOG_WRITER="$WRITER" \
+    "$CODEX_SCRIPT" "$CODEX_RECLASSIFY_JSONL"
+assert_file_contains "missing current derived view is repaired on retry" "$CODEX_RECLASSIFY_READABLE" 'record_kind: "interactive"'
 
 echo ""
 echo "=== Codex sync legacy noisy append ==="

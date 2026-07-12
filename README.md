@@ -12,8 +12,9 @@ AI との会話を自動で Markdown に保存し、Obsidian などのノート�
 
 - `AI-Logs/raw/<source>/YYYY-MM/<session_id>.md` — redaction 済み transcript。追記と復旧の基準になる保存実体。
 - `AI-Logs/readable/<source>/YYYY-MM/<session_id>.md` — 人間と LLM が普段読む派生ビュー。短い作業実況や明示的な automation wrapper は省く。
+- `AI-Logs/automation/codex/YYYY-MM/<session_id>.md` — Codex Automation の派生ビュー。通常会話の検索からは外す。
 
-Claude Code / Codex の新規 AI ログは `AI-Logs/raw` と `AI-Logs/readable` に分けて保存する。root 直下の旧 AI ログは互換のため追記対象として残す。ChatGPT 公式エクスポートの変換（`convert_to_obsidian.py`）は現時点では従来どおり root 直下に書く。ChatGPT 変換の移設は別作業として扱う。
+Claude Code / Codex の新規 AI ログは原本を `AI-Logs/raw` に保存し、通常会話の派生ビューを `AI-Logs/readable`、Codex Automation の派生ビューを `AI-Logs/automation` に保存する。root 直下の旧 AI ログは互換のため追記対象として残す。ChatGPT 公式エクスポートの変換（`convert_to_obsidian.py`）は現時点では従来どおり root 直下に書く。ChatGPT 変換の移設は別作業として扱う。
 
 ## セットアップ
 
@@ -97,6 +98,30 @@ plist だけを書いて読み込まない場合:
 ~/ai-second-brain/scripts/sync-codex-to-obsidian.sh "$CODEX_JSONL_FILE"
 ```
 
+### 4.1 Codex の Stop hook に軽量 checkpoint を登録
+
+Codex は `Stop` hook の stdin JSON に `session_id` と `transcript_path` を渡す。`~/.codex/hooks.json` の既存 `Stop` 配列へ次を追加する。既存の `notify` や他の Stop hook は上書きしない。
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "~/ai-second-brain/scripts/record-ai-session-checkpoint.sh --source codex --session-id ''",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+新しい hook は Codex の `/hooks` 画面で信頼確認が必要になる場合がある。この hook は同期を実行せず、更新時刻と JSONL path だけを state file に記録する。既存の idle sync により、最終ターンから通常15〜25分後に Second Brain へ反映される。
+
 ### 5. daily recovery を登録
 
 daily recovery は Stop hook や idle sync が取りこぼした session を、最近更新されたローカルログから回収する。デフォルトでは直近3日、最大50件だけを見る。
@@ -158,7 +183,11 @@ JSON
 
 Codex / Claude Code の同期では、明示的な automation wrapper（自動実行の状態通知）だけを保守的に省く。普通の会話で `heartbeat` や `cron` という単語が出てきた場合は保存する。
 
-省かれたメッセージがある場合は frontmatter に `omitted_msg_count` を残す。readable には routine chatter を入れない。raw は普段の検索対象から外し、必要なときだけ readable 末尾の `Raw` リンクから辿る。
+Codex Automation は最初の user message にある `Automation`, `Automation ID`, `Automation memory`, `Last run` の定型 envelope が完全一致した場合だけ機械的に分類する。タイトルだけが似ている通常会話は Automation 扱いしない。Automation の raw は保持し、派生ビューは `AI-Logs/automation` に分ける。
+
+既存rawの分類が変わった場合は新しい派生ビューを生成してから、旧派生を `AI_SECOND_BRAIN_STATE_DIR/reclassified-derived/<session-id>/` へSHA-256付きで退避する。旧派生に人間の追記があっても削除せず、その全バイトをbackupする。
+
+省かれたメッセージがある場合は frontmatter に `omitted_msg_count` を残す。raw はredaction（秘密情報の伏せ字）後の全メッセージを保持し、readableにはroutine chatterを入れない。raw は普段の検索対象から外し、必要なときだけ readable 末尾の `Raw` リンクから辿る。
 
 フィルタを一時的に無効にする場合:
 
@@ -173,6 +202,8 @@ AI_LOG_NOISE_FILTER=0 ~/ai-second-brain/scripts/sync-codex-to-obsidian.sh "$CODE
 ~/ai-second-brain/scripts/search-second-brain.sh "検索語"
 ```
 
+helper は root 全体を検索しない。root直下の非日付Markdown、`AI-Logs/readable`, `OpenClaw`, `_generated`, `plans` だけを対象にし、iCloud の未ダウンロード file は本文を開く前に除外する。Second Brain root の `.rgignore` でも dated legacy、raw、raw-archive、automation を二重に除外する。
+
 Obsidian アプリの検索やファイル一覧でも raw を普段見ないようにするには、vault ごとに1回だけ Excluded files（除外ファイル設定）を入れる。この設定は `SECOND_BRAIN_DIR` からの相対パスではなく、Obsidian vault root からの相対パスで書く。
 
 この環境のように vault root が `.../Documents/notes` で、`SECOND_BRAIN_DIR` がその配下の `Second-Brain` の場合は、Obsidian の `設定` → `ファイルとリンク` → `Excluded files` に以下を追加する:
@@ -180,6 +211,7 @@ Obsidian アプリの検索やファイル一覧でも raw を普段見ないよ
 ```text
 Second-Brain/AI-Logs/raw
 Second-Brain/AI-Logs/raw-archive
+Second-Brain/AI-Logs/automation
 ```
 
 `SECOND_BRAIN_DIR` 自体を Obsidian vault root にしている環境では、代わりに以下を追加する:
@@ -187,6 +219,7 @@ Second-Brain/AI-Logs/raw-archive
 ```text
 AI-Logs/raw
 AI-Logs/raw-archive
+AI-Logs/automation
 ```
 
 この設定は raw を削除しない。必要なときは readable 末尾の `Raw` リンクか、ファイルブラウザで除外設定を一時的に外して辿る。
@@ -195,6 +228,32 @@ AI-Logs/raw-archive
 
 ```bash
 ~/ai-second-brain/scripts/plan-root-ai-log-archive.py --format tsv
+```
+
+既存の readable に混ざった Codex Automation の移行候補も、まず dry-run manifest だけを出す:
+
+```bash
+state_root="${AI_SECOND_BRAIN_STATE_DIR:-$HOME/.claude/ai-second-brain-state}"
+manifest="$state_root/migrations/automation-view/manifests/automation-$(date +%Y%m%dT%H%M%S).jsonl"
+mkdir -p "$(dirname "$manifest")"
+~/ai-second-brain/scripts/plan-automation-view-migration.py > "$manifest"
+```
+
+このコマンドは同じ deterministic classifier（決定的な分類器）を使い、raw/readable の session ID、リンク、hash が一致する候補だけを JSONL で出す。ファイルは移動しない。
+
+manifestを確認して実移行を明示承認した後だけapplyする:
+
+```bash
+~/ai-second-brain/scripts/apply-automation-view-migration.py apply \
+  --manifest "$manifest" \
+  --root "$SECOND_BRAIN_DIR"
+```
+
+applyは全件のhash・mtime・inode・path・衝突を先に検証し、1件でもdriftがあれば変更前に停止する。backupとbatch journalは `AI_SECOND_BRAIN_STATE_DIR/migrations/automation-view/<batch-id>/` に残る。戻す場合はapply結果の `batch_dir` を指定する:
+
+```bash
+~/ai-second-brain/scripts/apply-automation-view-migration.py rollback \
+  --batch-dir "$batch_dir"
 ```
 
 ## スクリプト一覧
@@ -207,8 +266,11 @@ AI-Logs/raw-archive
 | `scripts/recover-ai-sessions-daily.sh` | 最近更新された session の日次回収 |
 | `scripts/save-openclaw-event.py` | OpenClaw/Himeno の重要イベント → source page |
 | `scripts/update-ai-log-summary.py` | 保存済みAIログの Summary/Decisions/Next Actions 更新 |
-| `scripts/search-second-brain.sh` | raw/raw-archive を除外して Second Brain を検索 |
+| `scripts/search-second-brain.sh` | 通常検索対象のうちローカル実体がある file だけを検索 |
+| `scripts/list-searchable-second-brain.py` | 通常検索対象の file を安全に列挙 |
 | `scripts/plan-root-ai-log-archive.py` | 旧 root 直下AIログの raw-archive 退避計画を dry-run 出力 |
+| `scripts/plan-automation-view-migration.py` | 誤分類された Automation 派生ビューの移行候補を dry-run 出力 |
+| `scripts/apply-automation-view-migration.py` | 凍結manifestを検証してAutomation派生をapply／rollback |
 | `scripts/sync-recall-to-obsidian.sh` | Claude Code 会話 → Markdown |
 | `scripts/sync-codex-to-obsidian.sh` | Codex セッション → Markdown |
 | `scripts/convert_to_obsidian.py` | ChatGPT エクスポート → Markdown |

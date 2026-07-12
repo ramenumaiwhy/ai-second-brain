@@ -79,10 +79,10 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-if [ -z "$session_id" ] && [ ! -t 0 ]; then
+if { [ -z "$session_id" ] || [ -z "$jsonl_path" ]; } && [ ! -t 0 ]; then
     hook_json=$(cat)
     if [ -n "$hook_json" ]; then
-        session_id=$(printf '%s' "$hook_json" | python3 -c "
+        hook_values=$(printf '%s' "$hook_json" | python3 -c "
 import json
 import sys
 
@@ -93,7 +93,14 @@ except json.JSONDecodeError:
 
 if isinstance(payload, dict):
     print(payload.get('session_id') or payload.get('sessionId') or '')
+    print(payload.get('transcript_path') or payload.get('transcriptPath') or '')
 ")
+        if [ -z "$session_id" ]; then
+            session_id=$(printf '%s\n' "$hook_values" | sed -n '1p')
+        fi
+        if [ -z "$jsonl_path" ]; then
+            jsonl_path=$(printf '%s\n' "$hook_values" | sed -n '2p')
+        fi
     fi
 fi
 
@@ -113,6 +120,45 @@ fi
 if [ -n "$jsonl_path" ] && { [ -L "$jsonl_path" ] || [ ! -f "$jsonl_path" ]; }; then
     printf 'Invalid JSONL path: %s\n' "$jsonl_path" >&2
     exit 2
+fi
+
+if [ "$source_name" = "codex" ] && [ -n "$jsonl_path" ]; then
+    CODEX_SESSIONS_DIR="${CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
+    if ! python3 - "$CODEX_SESSIONS_DIR" "$jsonl_path" "$session_id" <<'PY'
+import json
+import os
+import sys
+
+root = os.path.realpath(sys.argv[1])
+path = os.path.realpath(sys.argv[2])
+expected_session_id = sys.argv[3]
+if not path.startswith(root + os.sep) or not path.endswith(".jsonl"):
+    sys.exit(1)
+
+found_session_id = ""
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for index, line in enumerate(handle):
+            if index >= 100:
+                break
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "session_meta":
+                continue
+            payload = event.get("payload")
+            if isinstance(payload, dict):
+                found_session_id = str(payload.get("id") or "")
+            break
+except OSError:
+    sys.exit(1)
+sys.exit(0 if found_session_id == expected_session_id else 1)
+PY
+    then
+        printf 'Codex JSONL path or session metadata is invalid: %s\n' "$jsonl_path" >&2
+        exit 2
+    fi
 fi
 
 mkdir -p "$STATE_DIR"

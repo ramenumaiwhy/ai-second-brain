@@ -45,6 +45,7 @@ OBSIDIAN_DIR="${SECOND_BRAIN_DIR:?'Error: SECOND_BRAIN_DIR is not set. Set it to
 SYNC_LOG="$HOME/.claude/codex-sync.log"
 LOCK_DIR="$HOME/.claude/codex-obsidian-sync.lock"
 SID_INDEX="$HOME/.claude/codex-sid-index.tsv"
+AI_SECOND_BRAIN_STATE_DIR="${AI_SECOND_BRAIN_STATE_DIR:-$HOME/.claude/ai-second-brain-state}"
 SYNC_BUSY_EXIT_CODE="${SYNC_BUSY_EXIT_CODE:-0}"
 if [[ ! "$SYNC_BUSY_EXIT_CODE" =~ ^[0-9]+$ ]]; then
     SYNC_BUSY_EXIT_CODE=0
@@ -204,6 +205,191 @@ sys.exit(1)
 PY
 }
 
+rewrite_raw_classification() {
+    local file="$1"
+    local record_kind="$2"
+    local automation_id="$3"
+    local classification_rule="$4"
+    python3 - "$file" "$record_kind" "$automation_id" "$classification_rule" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+path, record_kind, automation_id, classification_rule = sys.argv[1:5]
+with open(path, "r", encoding="utf-8", errors="replace") as handle:
+    lines = handle.readlines()
+if not lines or lines[0].rstrip("\n") != "---":
+    raise SystemExit(1)
+
+values = {
+    "record_kind": json.dumps(record_kind, ensure_ascii=False),
+    "automation_id": json.dumps(automation_id, ensure_ascii=False) if automation_id else None,
+    "classification_rule": json.dumps(classification_rule, ensure_ascii=False) if classification_rule else None,
+}
+result = [lines[0]]
+seen = set()
+closed = False
+for line in lines[1:]:
+    if not closed and line.rstrip("\n") == "---":
+        for key in ("record_kind", "automation_id", "classification_rule"):
+            if key not in seen and values[key] is not None:
+                result.append(f"{key}: {values[key]}\n")
+        result.append(line)
+        closed = True
+        continue
+    if not closed and ":" in line:
+        key = line.split(":", 1)[0].strip()
+        if key in values:
+            seen.add(key)
+            if values[key] is not None:
+                result.append(f"{key}: {values[key]}\n")
+            continue
+    result.append(line)
+if not closed:
+    raise SystemExit(1)
+
+directory = os.path.dirname(path)
+fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".classification.")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.writelines(result)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, path)
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+except Exception:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    raise
+PY
+}
+
+derived_path_for_raw() {
+    local raw_file="$1"
+    local record_kind="$2"
+    python3 - "$OBSIDIAN_DIR" "$raw_file" "$record_kind" <<'PY'
+import os
+import sys
+
+root, raw_file, record_kind = sys.argv[1:4]
+relative = os.path.relpath(os.path.realpath(raw_file), os.path.realpath(root)).replace(os.sep, "/")
+if not relative.startswith("AI-Logs/raw/") or not relative.endswith(".md"):
+    raise SystemExit(1)
+view_root = "AI-Logs/automation" if record_kind == "automation" else "AI-Logs/readable"
+print(os.path.join(root, *(view_root + relative[len("AI-Logs/raw"):]).split("/")))
+PY
+}
+
+is_matching_derived_view() {
+    local view_file="$1"
+    local raw_file="$2"
+    local session_id="$3"
+    local expected_raw_hash="$4"
+    [ -f "$view_file" ] && [ ! -L "$view_file" ] || return 1
+    [ "$(frontmatter_value "$view_file" raw_session_id 2>/dev/null || true)" = "$session_id" ] || return 1
+    [ "$(frontmatter_value "$view_file" raw_hash 2>/dev/null || true)" = "$expected_raw_hash" ] || return 1
+    local expected_ref
+    expected_ref=$(python3 - "$OBSIDIAN_DIR" "$raw_file" <<'PY'
+import os
+import sys
+relative = os.path.relpath(os.path.realpath(sys.argv[2]), os.path.realpath(sys.argv[1])).replace(os.sep, "/")
+print(f"[[{relative[:-3]}]]" if relative.endswith(".md") else f"[[{relative}]]")
+PY
+)
+    [ "$(frontmatter_value "$view_file" raw_ref 2>/dev/null || true)" = "$expected_ref" ]
+}
+
+is_identity_derived_view() {
+    local view_file="$1"
+    local raw_file="$2"
+    local session_id="$3"
+    [ -f "$view_file" ] && [ ! -L "$view_file" ] || return 1
+    [ "$(frontmatter_value "$view_file" raw_session_id 2>/dev/null || true)" = "$session_id" ] || return 1
+    local expected_ref
+    expected_ref=$(python3 - "$OBSIDIAN_DIR" "$raw_file" <<'PY'
+import os
+import sys
+relative = os.path.relpath(os.path.realpath(sys.argv[2]), os.path.realpath(sys.argv[1])).replace(os.sep, "/")
+print(f"[[{relative[:-3]}]]" if relative.endswith(".md") else f"[[{relative}]]")
+PY
+)
+    [ "$(frontmatter_value "$view_file" raw_ref 2>/dev/null || true)" = "$expected_ref" ]
+}
+
+retire_derived_view() {
+    local view_file="$1"
+    local session_id="$2"
+    local old_record_kind="$3"
+    python3 - "$view_file" "$AI_SECOND_BRAIN_STATE_DIR" "$session_id" "$old_record_kind" <<'PY'
+import hashlib
+import os
+import re
+import sys
+import tempfile
+
+source, state_root, session_id, old_record_kind = sys.argv[1:5]
+safe_session = re.sub(r"[^A-Za-z0-9_.:-]+", "-", session_id).strip("-") or "session"
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(source, flags)
+try:
+    before = os.fstat(fd)
+    chunks = []
+    while chunk := os.read(fd, 1024 * 1024):
+        chunks.append(chunk)
+    after = os.fstat(fd)
+finally:
+    os.close(fd)
+identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+if identity_before != identity_after:
+    raise SystemExit("derived view changed while being backed up")
+data = b"".join(chunks)
+digest = hashlib.sha256(data).hexdigest()
+backup_dir = os.path.join(state_root, "reclassified-derived", safe_session)
+os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+destination = os.path.join(backup_dir, f"{old_record_kind}-{digest}.md")
+if os.path.exists(destination):
+    with open(destination, "rb") as handle:
+        if hashlib.sha256(handle.read()).hexdigest() != digest:
+            raise SystemExit("existing backup hash mismatch")
+else:
+    out_fd, tmp_path = tempfile.mkstemp(dir=backup_dir, prefix=".retire.")
+    try:
+        with os.fdopen(out_fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, destination)
+        dir_fd = os.open(backup_dir, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+with open(destination, "rb") as handle:
+    if hashlib.sha256(handle.read()).hexdigest() != digest:
+        raise SystemExit("backup verification failed")
+current = os.stat(source, follow_symlinks=False)
+current_identity = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+if current_identity != identity_after:
+    raise SystemExit("derived view changed before retirement")
+os.unlink(source)
+PY
+}
+
 is_ai_logs_raw_file() {
     local file="$1"
     python3 - "$OBSIDIAN_DIR" "$file" <<'PY'
@@ -227,13 +413,15 @@ write_readable_log() {
     local record_kind="$7"
     local raw_file="$8"
     local omitted_msg_count="$9"
+    local automation_id="${10:-}"
+    local classification_rule="${11:-}"
 
     local readable_dir readable_file raw_ref raw_hash tmp_readable readable_meta
-    readable_meta=$(python3 - "$OBSIDIAN_DIR" "$raw_file" "$source_key" "$date_str" <<'PY'
+    readable_meta=$(python3 - "$OBSIDIAN_DIR" "$raw_file" "$source_key" "$date_str" "$record_kind" <<'PY'
 import os
 import sys
 
-root, raw_file, source_key, date_str = sys.argv[1:5]
+root, raw_file, source_key, date_str, record_kind = sys.argv[1:6]
 root_real = os.path.realpath(root)
 raw_real = os.path.realpath(raw_file)
 try:
@@ -242,12 +430,14 @@ except ValueError:
     rel = ""
 if rel.startswith("AI-Logs/raw/") and rel.endswith(".md"):
     raw_stem = rel[:-3]
-    readable_rel = "AI-Logs/readable/" + raw_stem[len("AI-Logs/raw/"):] + ".md"
+    view_root = "AI-Logs/automation" if record_kind == "automation" else "AI-Logs/readable"
+    readable_rel = view_root + "/" + raw_stem[len("AI-Logs/raw/"):] + ".md"
 else:
     session_name = os.path.basename(raw_file[:-3] if raw_file.endswith(".md") else raw_file)
     month = date_str.rsplit("-", 1)[0]
     raw_stem = f"AI-Logs/raw/{source_key}/{month}/{session_name}"
-    readable_rel = f"AI-Logs/readable/{source_key}/{month}/{session_name}.md"
+    view_root = "AI-Logs/automation" if record_kind == "automation" else "AI-Logs/readable"
+    readable_rel = f"{view_root}/{source_key}/{month}/{session_name}.md"
 print(f"[[{raw_stem}]]")
 print(os.path.join(root, *readable_rel.split("/")))
 PY
@@ -267,6 +457,8 @@ PY
         --raw-ref="$raw_ref" \
         --raw-hash="$raw_hash" \
         --record-kind="$record_kind" \
+        --automation-id="$automation_id" \
+        --classification-rule="$classification_rule" \
         --omitted-msg-count=0 \
         --tag="$source_key" > "$tmp_readable"; then
         rm -f "$tmp_readable" 2>/dev/null || true
@@ -746,6 +938,22 @@ sync_session_file() {
     fi
     raw_extract_result="$extract_result"
 
+    local classification detected_record_kind automation_id classification_rule
+    if ! classification=$(printf '%s' "$raw_extract_result" | ai_log_writer classify); then
+        printf '%s: session classification failed for %s\n' "$(date)" "$jsonl_file" >> "$SYNC_LOG"
+        return 1
+    fi
+    detected_record_kind=$(printf '%s' "$classification" | jq -r '.record_kind // "interactive"')
+    automation_id=$(printf '%s' "$classification" | jq -r '.automation_id // empty')
+    classification_rule=$(printf '%s' "$classification" | jq -r '.classification_rule // empty')
+
+    local session_record_kind
+    session_record_kind="${RECORD_KIND:-$detected_record_kind}"
+    if [ "$session_record_kind" != "automation" ]; then
+        automation_id=""
+        classification_rule=""
+    fi
+
     if ! filtered_extract_result=$(printf '%s' "$raw_extract_result" | ai_log_writer filter); then
         printf '%s: ai-log noise filter failed for %s\n' "$(date)" "$jsonl_file" >> "$SYNC_LOG"
         return 1
@@ -776,7 +984,7 @@ sync_session_file() {
         return 1
     fi
 
-    if [ -z "$existing_file" ] && [ "$msg_count" -eq 0 ]; then
+    if [ -z "$existing_file" ] && [ "$raw_msg_count" -eq 0 ]; then
         return 0
     fi
 
@@ -797,33 +1005,81 @@ sync_session_file() {
         fi
 
         if is_shared_ai_log_record "$existing_file"; then
-            if [ "$msg_count" -le "$existing_msg_count" ] && [ "$raw_msg_count" -le "$existing_msg_count" ]; then
-                return 0
+            local existing_title existing_record_kind existing_automation_id existing_classification_rule
+            local classification_changed=0 is_raw_record=0 old_raw_hash="" current_view="" current_view_valid=0
+            local stale_view="" stale_view_verified=0 stale_record_kind=""
+            existing_title=$(frontmatter_value "$existing_file" title 2>/dev/null || printf 'untitled')
+            existing_record_kind=$(frontmatter_value "$existing_file" record_kind 2>/dev/null || printf 'interactive')
+            existing_automation_id=$(frontmatter_value "$existing_file" automation_id 2>/dev/null || true)
+            existing_classification_rule=$(frontmatter_value "$existing_file" classification_rule 2>/dev/null || true)
+            if is_ai_logs_raw_file "$existing_file"; then
+                is_raw_record=1
+                old_raw_hash=$(file_sha256 "$existing_file")
+                if [ "$existing_record_kind" != "$session_record_kind" ] \
+                    || [ "$existing_automation_id" != "$automation_id" ] \
+                    || [ "$existing_classification_rule" != "$classification_rule" ]; then
+                    classification_changed=1
+                fi
+                current_view=$(derived_path_for_raw "$existing_file" "$session_record_kind" || true)
+                if [ -n "$current_view" ] && is_matching_derived_view "$current_view" "$existing_file" "$sid" "$old_raw_hash"; then
+                    current_view_valid=1
+                fi
+                if [ "$session_record_kind" = "automation" ]; then
+                    stale_record_kind="interactive"
+                else
+                    stale_record_kind="automation"
+                fi
+                stale_view=$(derived_path_for_raw "$existing_file" "$stale_record_kind" || true)
+                if [ -n "$stale_view" ] && is_identity_derived_view "$stale_view" "$existing_file" "$sid"; then
+                    stale_view_verified=1
+                fi
             fi
 
-            tmp_file=$(mktemp "$OBSIDIAN_DIR/.tmp_update.XXXXXX") || return 1
-            if ! printf '%s' "$raw_extract_result" | ai_log_writer append \
-                --existing-file "$existing_file" > "$tmp_file"; then
-                printf '%s: Shared append failed for %s\n' "$(date)" "$existing_file" >> "$SYNC_LOG"
-                return 1
+            if [ "$msg_count" -le "$existing_msg_count" ] \
+                && [ "$raw_msg_count" -le "$existing_msg_count" ] \
+                && [ "$classification_changed" -eq 0 ]; then
+                if [ "$is_raw_record" -eq 0 ] || { [ "$current_view_valid" -eq 1 ] && [ ! -e "$stale_view" ]; }; then
+                    return 0
+                fi
             fi
-            if cmp -s "$existing_file" "$tmp_file"; then
-                rm -f "$tmp_file" 2>/dev/null || true
-                tmp_file=""
-                return 0
+
+            if [ "$msg_count" -gt "$existing_msg_count" ] || [ "$raw_msg_count" -gt "$existing_msg_count" ]; then
+                tmp_file=$(mktemp "$OBSIDIAN_DIR/.tmp_update.XXXXXX") || return 1
+                if ! printf '%s' "$raw_extract_result" | ai_log_writer append \
+                    --existing-file "$existing_file" > "$tmp_file"; then
+                    printf '%s: Shared append failed for %s\n' "$(date)" "$existing_file" >> "$SYNC_LOG"
+                    return 1
+                fi
+                if cmp -s "$existing_file" "$tmp_file"; then
+                    rm -f "$tmp_file" 2>/dev/null || true
+                    tmp_file=""
+                else
+                    if ! mv -f "$tmp_file" "$existing_file"; then
+                        printf '%s: Failed to move updated file for %s\n' "$(date)" "$existing_file" >> "$SYNC_LOG"
+                        return 1
+                    fi
+                    tmp_file=""
+                    printf '%s: Appended to %s (%s -> %s)\n' "$(date)" "$existing_file" "$existing_msg_count" "$raw_msg_count" >> "$SYNC_LOG"
+                fi
             fi
-            if ! mv -f "$tmp_file" "$existing_file"; then
-                printf '%s: Failed to move updated file for %s\n' "$(date)" "$existing_file" >> "$SYNC_LOG"
-                return 1
-            fi
-            tmp_file=""
-            printf '%s: Appended to %s (%s -> %s)\n' "$(date)" "$existing_file" "$existing_msg_count" "$msg_count" >> "$SYNC_LOG"
-            if is_ai_logs_raw_file "$existing_file"; then
-                local existing_title existing_record_kind
-                existing_title=$(frontmatter_value "$existing_file" title 2>/dev/null || printf 'untitled')
-                existing_record_kind=$(frontmatter_value "$existing_file" record_kind 2>/dev/null || printf '%s' "${RECORD_KIND:-interactive}")
-                if ! write_readable_log "$raw_extract_result" "$date_str" "$existing_title" "Codex" "codex" "$sid" "$existing_record_kind" "$existing_file" "$omitted_msg_count"; then
+
+            if [ "$is_raw_record" -eq 1 ]; then
+                if [ "$classification_changed" -eq 1 ] \
+                    && ! rewrite_raw_classification "$existing_file" "$session_record_kind" "$automation_id" "$classification_rule"; then
+                    printf '%s: Failed to reclassify raw log %s\n' "$(date)" "$existing_file" >> "$SYNC_LOG"
+                    return 1
+                fi
+                if ! write_readable_log "$raw_extract_result" "$date_str" "$existing_title" "Codex" "codex" "$sid" "$session_record_kind" "$existing_file" "$omitted_msg_count" "$automation_id" "$classification_rule"; then
                     printf '%s: Failed to update readable log for %s\n' "$(date)" "$existing_file" >> "$SYNC_LOG"
+                    return 1
+                fi
+                if [ "$stale_view_verified" -eq 1 ]; then
+                    if ! retire_derived_view "$stale_view" "$sid" "$stale_record_kind"; then
+                        printf '%s: Failed to back up stale derived view %s\n' "$(date)" "$stale_view" >> "$SYNC_LOG"
+                        return 1
+                    fi
+                elif [ -n "$stale_view" ] && [ -e "$stale_view" ]; then
+                    printf '%s: Refusing to retire unverified stale derived view %s\n' "$(date)" "$stale_view" >> "$SYNC_LOG"
                     return 1
                 fi
             fi
@@ -1028,7 +1284,7 @@ print('untitled')
     fi
 
     local record_kind
-    record_kind="${RECORD_KIND:-interactive}"
+    record_kind="$session_record_kind"
 
     local source_key month session_name raw_dir filename filepath readable_dir
     source_key="codex"
@@ -1045,13 +1301,16 @@ print('untitled')
         return 1
     }
 
-    if ! printf '%s' "$messages_json" | ai_log_writer create \
+    if ! printf '%s' "$raw_extract_result" | ai_log_writer create \
         --date="$date_str" \
         --title="$title" \
         --source="Codex" \
         --session-id="$sid" \
         --record-kind="$record_kind" \
-        --omitted-msg-count="$omitted_msg_count" \
+        --automation-id="$automation_id" \
+        --classification-rule="$classification_rule" \
+        --preserve-all \
+        --omitted-msg-count=0 \
         --tag="codex" > "$tmp_file"; then
         printf '%s: Failed to write temp file for session %s\n' "$(date)" "$sid" >> "$SYNC_LOG"
         return 1
@@ -1093,7 +1352,7 @@ finally:
     os.close(dir_fd)
 " "$raw_dir"
 
-    if ! write_readable_log "$raw_extract_result" "$date_str" "$title" "Codex" "$source_key" "$sid" "$record_kind" "$filepath" "$omitted_msg_count"; then
+    if ! write_readable_log "$raw_extract_result" "$date_str" "$title" "Codex" "$source_key" "$sid" "$record_kind" "$filepath" "$omitted_msg_count" "$automation_id" "$classification_rule"; then
         printf '%s: Failed to write readable file for session %s\n' "$(date)" "$sid" >> "$SYNC_LOG"
         return 1
     fi

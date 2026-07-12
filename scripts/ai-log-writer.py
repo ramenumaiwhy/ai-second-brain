@@ -19,6 +19,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REDACTION_HELPER = Path(os.environ.get("REDACTION_HELPER", SCRIPT_DIR / "redact-secrets.py"))
 ENTRY_HEADING_RE = re.compile(r"^### (User|Assistant) \d+$")
 READABLE_GENERATOR_VERSION = "ai-log-readable-v1"
+AUTOMATION_CLASSIFICATION_RULE = "codex-automation-envelope-v1"
+AUTOMATION_ENVELOPE_RE = re.compile(
+    r"\AAutomation: (?P<title>[^\n]+)\n"
+    r"Automation ID: (?P<id>[a-z0-9]+(?:-[a-z0-9]+)*)\n"
+    r"Automation memory: \$CODEX_HOME/automations/(?P=id)/memory\.md\n"
+    r"Last run: [^\n]+\n"
+    r"(?:\n|$)"
+)
 DEFAULT_NOISE_PATTERN_TEXTS = (
     r"^\s*(?:#\s*)?(?:heartbeat|cron|checkpoint)\s+automation\s*:?\s*"
     r"(?:completed|started|finished|no changes|no-op|noop|checked|triggered|"
@@ -528,6 +536,47 @@ def filter_messages(args: argparse.Namespace) -> int:
     return 0
 
 
+def classify_message_list(data: object) -> dict[str, str]:
+    if isinstance(data, dict):
+        data = data.get("messages", [])
+
+    result = {
+        "record_kind": "interactive",
+        "automation_id": "",
+        "classification_rule": "",
+    }
+    for message in data:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        text_value = redact_text(message_text(message))
+        normalized = text_value.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not normalized:
+            continue
+        match = AUTOMATION_ENVELOPE_RE.match(normalized)
+        if match:
+            automation_id = match.group("id")
+            instruction = normalized[match.end():].strip()
+            if instruction and len(automation_id) <= 128:
+                result = {
+                    "record_kind": "automation",
+                    "automation_id": automation_id,
+                    "classification_rule": AUTOMATION_CLASSIFICATION_RULE,
+                }
+        break
+
+    return result
+
+
+def classify_messages(_args: argparse.Namespace) -> int:
+    raw = sys.stdin.read()
+    data = json.loads(raw) if raw.strip() else []
+    result = classify_message_list(data)
+
+    json.dump(result, sys.stdout, ensure_ascii=False, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
 def generated_at_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -594,6 +643,12 @@ def render_readable_record(args: argparse.Namespace) -> int:
         f"raw_ref: {yaml_quote(args.raw_ref)}\n",
         f"raw_session_id: {yaml_quote(args.raw_session_id)}\n",
         f"record_kind: {yaml_quote(args.record_kind)}\n",
+        *([f"automation_id: {yaml_quote(args.automation_id)}\n"] if args.automation_id else []),
+        *(
+            [f"classification_rule: {yaml_quote(args.classification_rule)}\n"]
+            if args.classification_rule
+            else []
+        ),
         f"msg_count: {kept_count}\n",
         *([f"omitted_msg_count: {total_omitted_count}\n"] if total_omitted_count > 0 else []),
         f"raw_hash: {yaml_quote(args.raw_hash)}\n",
@@ -801,7 +856,8 @@ def render_append_from_messages(
 
 
 def create_record(args: argparse.Namespace) -> int:
-    messages, omitted_count = load_messages()
+    all_messages, kept_messages, omitted_count = load_message_sets()
+    messages = all_messages if args.preserve_all else kept_messages
     omitted_count += args.omitted_msg_count
     transcript, entries = format_entries(messages)
     metadata = transcript_metadata(transcript, entries)
@@ -817,6 +873,12 @@ def create_record(args: argparse.Namespace) -> int:
         f"source: {yaml_quote(args.source)}\n",
         f"session_id: {yaml_quote(args.session_id)}\n",
         f"record_kind: {yaml_quote(args.record_kind)}\n",
+        *([f"automation_id: {yaml_quote(args.automation_id)}\n"] if args.automation_id else []),
+        *(
+            [f"classification_rule: {yaml_quote(args.classification_rule)}\n"]
+            if args.classification_rule
+            else []
+        ),
         f"msg_count: {metadata['msg_count']}\n",
         f"last_message_hash: {yaml_quote(str(metadata['last_message_hash']))}\n",
         f"transcript_hash: {yaml_quote(str(metadata['transcript_hash']))}\n",
@@ -930,6 +992,9 @@ def main() -> int:
     create.add_argument("--source", required=True)
     create.add_argument("--session-id", required=True)
     create.add_argument("--record-kind", required=True)
+    create.add_argument("--automation-id", default="")
+    create.add_argument("--classification-rule", default="")
+    create.add_argument("--preserve-all", action="store_true")
     create.add_argument("--omitted-msg-count", type=int, default=0)
     create.add_argument("--tag", action="append", default=[])
     create.set_defaults(func=create_record)
@@ -951,11 +1016,16 @@ def main() -> int:
     readable.add_argument("--raw-ref", required=True)
     readable.add_argument("--raw-hash", required=True)
     readable.add_argument("--record-kind", required=True)
+    readable.add_argument("--automation-id", default="")
+    readable.add_argument("--classification-rule", default="")
     readable.add_argument("--omitted-msg-count", type=int, default=0)
     readable.add_argument("--generated-at", default="")
     readable.add_argument("--generator-version", default=READABLE_GENERATOR_VERSION)
     readable.add_argument("--tag", action="append", default=[])
     readable.set_defaults(func=render_readable_record)
+
+    classify = subparsers.add_parser("classify")
+    classify.set_defaults(func=classify_messages)
 
     args = parser.parse_args()
     return args.func(args)
