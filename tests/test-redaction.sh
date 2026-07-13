@@ -1078,22 +1078,35 @@ echo "=== Claude sync redaction ==="
 export HOME="$TEST_DIR/home"
 export SECOND_BRAIN_DIR="$TEST_DIR/claude-obsidian"
 export REDACTION_HELPER
-mkdir -p "$HOME/.claude" "$SECOND_BRAIN_DIR"
+export CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+CLAUDE_JSONL="$CLAUDE_PROJECTS_DIR/redaction-claude-session.jsonl"
+mkdir -p "$CLAUDE_PROJECTS_DIR" "$SECOND_BRAIN_DIR"
 
-MOCK_BIN="$TEST_DIR/bin"
-mkdir -p "$MOCK_BIN"
-cat > "$MOCK_BIN/recall" <<'MOCK_EOF'
-#!/bin/bash
-if [ "$1" = "read" ]; then
-    cat "$MOCK_RECALL_DATA"
-elif [ "$1" = "list" ]; then
-    printf '{"sessions":[]}\n'
-fi
-MOCK_EOF
-chmod +x "$MOCK_BIN/recall"
-export PATH="$MOCK_BIN:$PATH"
+write_claude_jsonl_fixture() {
+    python3 - "$1" "$CLAUDE_JSONL" <<'PY'
+import json
+import sys
 
-export MOCK_RECALL_DATA="$REPO_DIR/tests/fixtures/claude-redaction-session.json"
+fixture, output = sys.argv[1:3]
+with open(fixture, encoding="utf-8") as handle:
+    data = json.load(handle)
+with open(output, "w", encoding="utf-8") as handle:
+    for message in data.get("messages", []):
+        role = message.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        record = {
+            "type": role,
+            "sessionId": "redaction-claude-session",
+            "timestamp": message.get("timestamp") or data.get("timestamp") or "2026-06-02T00:00:00Z",
+            "message": {"role": role, "content": message.get("content", "")},
+        }
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+PY
+}
+
+write_claude_jsonl_fixture "$REPO_DIR/tests/fixtures/claude-redaction-session.json"
+export CLAUDE_SESSION_JSONL_PATH="$CLAUDE_JSONL"
 bash "$REPO_DIR/scripts/sync-recall-to-obsidian.sh" "redaction-claude-session"
 
 CLAUDE_MD=$(raw_markdown_by_session_id "$SECOND_BRAIN_DIR" "redaction-claude-session")
@@ -1111,7 +1124,7 @@ else
     assert_file_contains "claude writes redaction marker" "$CLAUDE_MD" "[REDACTED]"
 fi
 
-export MOCK_RECALL_DATA="$REPO_DIR/tests/fixtures/claude-redaction-session-updated.json"
+write_claude_jsonl_fixture "$REPO_DIR/tests/fixtures/claude-redaction-session-updated.json"
 bash "$REPO_DIR/scripts/sync-recall-to-obsidian.sh" "redaction-claude-session"
 
 if [ -n "${CLAUDE_MD:-}" ]; then

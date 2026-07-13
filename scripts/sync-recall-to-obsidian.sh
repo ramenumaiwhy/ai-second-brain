@@ -1,6 +1,7 @@
 #!/bin/bash
-# recall → Obsidian 同期スクリプト (tested)
+# Claude Code JSONL → Obsidian 同期スクリプト
 # 明示保存、idle sync、daily recovery から呼ばれる
+# ファイル名とstate/log名は既存設定との互換性のため維持する
 
 set -euo pipefail
 umask 077
@@ -26,7 +27,7 @@ export LC_ALL=en_US.UTF-8
 export LANG=en_US.UTF-8
 
 # 依存コマンドの存在確認（macOS前提: stat -f）
-for cmd in recall jq python3 shasum; do
+for cmd in jq python3 shasum; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "$(date): Required command '$cmd' not found" >&2
         exit 1
@@ -55,29 +56,58 @@ mkdir -p "$HOME/.claude"
 # 引数でセッションIDが渡された場合はそれだけ同期、なければ全セッション
 SESSION_ID="${1:-}"
 
-# recall read が失敗した場合にJSONLファイルから直接読む（フォークセッション対応）
+# 明示pathがClaudeの許可root内にある通常のJSONLか検証し、realpathを返す。
+validate_claude_jsonl_path() {
+    python3 - "${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}" "$1" <<'PY'
+import os
+import sys
+
+root, path = map(os.path.expanduser, sys.argv[1:3])
+if os.path.islink(root) or not os.path.isdir(root):
+    sys.exit(1)
+if os.path.islink(path) or not os.path.isfile(path) or not path.endswith(".jsonl"):
+    sys.exit(1)
+real_root = os.path.realpath(root)
+real_path = os.path.realpath(path)
+try:
+    if os.path.commonpath((real_root, real_path)) != real_root:
+        sys.exit(1)
+except ValueError:
+    sys.exit(1)
+print(real_path)
+PY
+}
+
+# path未指定時はsession IDと同名のJSONLだけを探す。複数候補は選ばない。
+resolve_claude_jsonl_path() {
+    python3 - "${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}" "$1" <<'PY'
+import os
+import sys
+
+root, session_id = map(os.path.expanduser, sys.argv[1:3])
+if os.path.islink(root) or not os.path.isdir(root):
+    sys.exit(1)
+target = f"{session_id}.jsonl"
+matches = []
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))]
+    if target not in filenames:
+        continue
+    path = os.path.join(dirpath, target)
+    if os.path.islink(path) or not os.path.isfile(path):
+        continue
+    matches.append(os.path.realpath(path))
+if len(matches) != 1:
+    sys.exit(1)
+print(matches[0])
+PY
+}
+
 read_from_jsonl() {
     local sid="$1"
-    local jsonl_dir="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+    local jsonl_file="$2"
 
-    # セッションIDに対応するJSONLファイルを探す（claude/codex両方を探索）
-    local jsonl_file=""
-    if [ -n "${CLAUDE_SESSION_JSONL_PATH:-}" ]; then
-        if [ -L "$CLAUDE_SESSION_JSONL_PATH" ] || [ ! -f "$CLAUDE_SESSION_JSONL_PATH" ]; then
-            return 1
-        fi
-        jsonl_file="$CLAUDE_SESSION_JSONL_PATH"
-    else
-        local find_paths=("$jsonl_dir")
-        [ -d "$HOME/.codex/sessions" ] && find_paths+=("$HOME/.codex/sessions")
-        jsonl_file=$(find "${find_paths[@]}" -name "${sid}.jsonl" -type f 2>/dev/null | head -1) || true
-    fi
-
-    if [ -z "$jsonl_file" ]; then
-        return 1
-    fi
-
-    # JSONLからrecall read互換のJSON構造を生成
+    # JSONLから既存writer互換のJSON構造を生成
     python3 -c "
 import json
 import os
@@ -85,10 +115,7 @@ import sys
 
 sid = sys.argv[1]
 jsonl_path = sys.argv[2]
-allow_missing_sid = (
-    os.path.basename(jsonl_path) == f'{sid}.jsonl'
-    or os.environ.get('CLAUDE_SESSION_JSONL_PATH') == jsonl_path
-)
+allow_missing_sid = os.path.basename(jsonl_path) == f'{sid}.jsonl'
 
 messages = []
 first_timestamp = None
@@ -523,7 +550,7 @@ for root, recursive in search_roots:
 " "$sid" "$target_dir"
 }
 
-format_recall_messages_as_markdown() {
+format_messages_as_markdown() {
     local json="$1"
     local skip_count="${2:-0}"
     local q_count="${3:-0}"
@@ -655,52 +682,25 @@ sync_session() {
     local sid="$1"
     local json
     local persisted_sid="$sid"
+    local jsonl_file
 
     if [ -n "${CLAUDE_SESSION_JSONL_PATH:-}" ]; then
-        json=$(read_from_jsonl "$sid") || true
-        if [ -z "$json" ]; then
-            echo "$(date): Failed to read requested JSONL for session $sid" >> "$SYNC_LOG"
+        if ! jsonl_file=$(validate_claude_jsonl_path "$CLAUDE_SESSION_JSONL_PATH"); then
+            echo "$(date): Invalid requested Claude JSONL path for session $sid" >> "$SYNC_LOG"
             return 1
         fi
-        persisted_sid=$(persisted_session_id "$sid" "$CLAUDE_SESSION_JSONL_PATH") || return 1
-        echo "$(date): Using requested JSONL fallback for session $sid" >> "$SYNC_LOG"
-    else
-        # recall readはフォークセッション等で正常にexit 1を返すため、|| trueで受けてフォールバックへ進む
-        json=$(recall read "$sid" 2>/dev/null) || true
-
-        # #3: 非空だが不正JSONの場合もフォールバックへ回す
-        if [ -n "$json" ] && ! printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
-            echo "$(date): Invalid JSON from recall for session $sid, trying fallback" >> "$SYNC_LOG"
-            json=""
-        fi
-
-        if [ -z "$json" ]; then
-            # recall CLIで読めない場合、JSONLファイルから直接読む（フォークセッション対応）
-            # read_from_jsonlはファイル未発見で正常にexit 1を返すため、|| trueで受ける
-            json=$(read_from_jsonl "$sid") || true
-            if [ -z "$json" ]; then
-                echo "$(date): Failed to read session $sid (recall + jsonl fallback)" >> "$SYNC_LOG"
-                return 1
-            fi
-            echo "$(date): Using JSONL fallback for session $sid (recall empty)" >> "$SYNC_LOG"
-        else
-            # recall read が返したメッセージ数とJSONLのメッセージ数を比較
-            # recall read が極端に少ない場合（JSONLの半分未満）はJSONLフォールバックを使う
-            local recall_msg_count
-            recall_msg_count=$(printf '%s' "$json" | jq '(.messages // []) | length' 2>/dev/null) || recall_msg_count=0
-            local jsonl_json
-            jsonl_json=$(read_from_jsonl "$sid" 2>/dev/null) || true
-            if [ -n "$jsonl_json" ]; then
-                local jsonl_msg_count
-                jsonl_msg_count=$(printf '%s' "$jsonl_json" | jq '(.messages // []) | length' 2>/dev/null) || jsonl_msg_count=0
-                if [ "$jsonl_msg_count" -gt 0 ] && [ "$recall_msg_count" -gt 0 ] && \
-                   [ "$jsonl_msg_count" -ge $((recall_msg_count * 2)) ]; then
-                    echo "$(date): JSONL has significantly more messages ($jsonl_msg_count) than recall ($recall_msg_count) for session $sid, using JSONL" >> "$SYNC_LOG"
-                    json="$jsonl_json"
-                fi
-            fi
-        fi
+    elif ! jsonl_file=$(resolve_claude_jsonl_path "$sid"); then
+        echo "$(date): Claude JSONL not found or ambiguous for session $sid" >> "$SYNC_LOG"
+        return 1
     fi
+
+    json=$(read_from_jsonl "$sid" "$jsonl_file") || true
+    if [ -z "$json" ]; then
+        echo "$(date): Failed to read Claude JSONL for session $sid" >> "$SYNC_LOG"
+        return 1
+    fi
+    persisted_sid=$(persisted_session_id "$sid" "$jsonl_file") || return 1
+    echo "$(date): Using Claude JSONL for session $sid" >> "$SYNC_LOG"
 
     # 必須フィールドの検証
     local timestamp source
@@ -834,7 +834,7 @@ sync_session() {
         a_count=$(grep -cE '^## A[0-9]+' "$existing_file" 2>/dev/null) || true
 
         local append_content
-        append_content=$(format_recall_messages_as_markdown "$append_json" "$skip_count" "$q_count" "$a_count") || {
+        append_content=$(format_messages_as_markdown "$append_json" "$skip_count" "$q_count" "$a_count") || {
             echo "$(date): ERROR: redacted markdown generation failed during diff-append for session $sid" >> "$SYNC_LOG"
             return 1
         }
@@ -1074,34 +1074,68 @@ if [ -n "$SESSION_ID" ]; then
     # 特定セッションだけ同期
     sync_session "$SESSION_ID"
 else
-    # 全セッションを同期
-    recall_output=$(recall list 2>/dev/null) || {
-        echo "$(date): Failed to get session list from recall" >> "$SYNC_LOG"
+    # Claudeのprovider JSONLを直接列挙する。同じsession IDの複数pathは別IDで保存する。
+    session_rows=$(python3 - "${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}" <<'PY'
+import json
+import os
+import sys
+from collections import Counter
+
+root = os.path.expanduser(sys.argv[1])
+if os.path.islink(root) or not os.path.isdir(root):
+    sys.exit(1)
+rows = []
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))]
+    for filename in filenames:
+        if not filename.endswith(".jsonl"):
+            continue
+        path = os.path.join(dirpath, filename)
+        if os.path.islink(path) or not os.path.isfile(path):
+            continue
+        session_id = ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    session_id = str(record.get("sessionId") or record.get("session_id") or "")
+                    if session_id:
+                        break
+        except OSError:
+            continue
+        if not session_id:
+            session_id = filename[:-6]
+        if any(char in session_id for char in "\t\r\n"):
+            continue
+        rows.append((session_id, os.path.realpath(path)))
+counts = Counter(session_id for session_id, _path in rows)
+for session_id, path in sorted(rows):
+    mode = "path" if counts[session_id] > 1 else "-"
+    print(f"{session_id}\t{path}\t{mode}")
+PY
+) || {
+        echo "$(date): Failed to enumerate Claude JSONL sessions" >> "$SYNC_LOG"
         exit 1
     }
-
-    # JSON形式の検証
-    if ! printf '%s' "$recall_output" | jq -e '.sessions' >/dev/null 2>&1; then
-        echo "$(date): Invalid JSON from recall list" >> "$SYNC_LOG"
-        exit 1
-    fi
-
-    # パイプ経由のwhileだとサブシェルになり、jq失敗がサイレントになるため変数展開で処理
-    # codexセッションは sync-codex-to-obsidian.sh が担当するので除外
-    session_ids=$(printf '%s' "$recall_output" | jq -r '.sessions[] | select(.source != "codex") | .session_id' 2>/dev/null) || {
-        echo "$(date): Failed to extract session IDs from recall list" >> "$SYNC_LOG"
-        exit 1
-    }
-
     sync_fail=0
-    while read -r sid; do
+    while IFS=$'\t' read -r sid jsonl_path identity_mode; do
         if [ -n "$sid" ]; then
-            sync_session "$sid" || {
-                echo "$(date): Failed to sync session $sid (continuing)" >> "$SYNC_LOG"
-                sync_fail=$((sync_fail + 1))
-            }
+            if [ "$identity_mode" = "path" ]; then
+                CLAUDE_SESSION_JSONL_PATH="$jsonl_path" CLAUDE_SESSION_IDENTITY_MODE=path sync_session "$sid" || {
+                    echo "$(date): Failed to sync session $sid (continuing)" >> "$SYNC_LOG"
+                    sync_fail=$((sync_fail + 1))
+                }
+            else
+                CLAUDE_SESSION_JSONL_PATH="$jsonl_path" sync_session "$sid" || {
+                    echo "$(date): Failed to sync session $sid (continuing)" >> "$SYNC_LOG"
+                    sync_fail=$((sync_fail + 1))
+                }
+            fi
         fi
-    done <<< "$session_ids"
+    done <<< "$session_rows"
 
     echo "$(date): Full sync completed (failures: $sync_fail)" >> "$SYNC_LOG"
 fi

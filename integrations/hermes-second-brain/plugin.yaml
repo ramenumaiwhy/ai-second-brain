@@ -1,0 +1,10 @@
+name: second-brain
+version: 1.0.0
+description: "Save completed Hermes turns to AI Second Brain immediately through a post_llm_call hook. No cron or background scheduler."
+author: ramenumaiwhy
+kind: standalone
+platforms:
+  - macos
+  - linux
+hooks:
+  - post_llm_call

@@ -28,7 +28,7 @@ LOCK_DIR="$STATE_DIR/idle-sync.lock"
 STATE_LOCK_DIR="$STATE_DIR/state.lock"
 IDLE_MIN_AGE_SECONDS="${AI_IDLE_MIN_AGE_SECONDS:-900}"
 IDLE_MAX_SESSIONS="${AI_IDLE_MAX_SESSIONS:-20}"
-SYNC_RECALL_SCRIPT="${SYNC_RECALL_SCRIPT:-$SCRIPT_DIR/sync-recall-to-obsidian.sh}"
+SYNC_CLAUDE_SCRIPT="${SYNC_CLAUDE_SCRIPT:-${SYNC_RECALL_SCRIPT:-$SCRIPT_DIR/sync-recall-to-obsidian.sh}}"
 SYNC_CODEX_SCRIPT="${SYNC_CODEX_SCRIPT:-$SCRIPT_DIR/sync-codex-to-obsidian.sh}"
 
 if [[ ! "$IDLE_MIN_AGE_SECONDS" =~ ^[0-9]+$ ]] || [[ ! "$IDLE_MAX_SESSIONS" =~ ^[0-9]+$ ]]; then
@@ -328,18 +328,31 @@ while IFS=$'\t' read -r expected_updated_at source_name session_id jsonl_path; d
 
     case "$source_name" in
         claude)
-            if SYNC_BUSY_EXIT_CODE=75 "$SYNC_RECALL_SCRIPT" "$session_id"; then
+            if [ -n "$jsonl_path" ]; then
+                if CLAUDE_SESSION_JSONL_PATH="$jsonl_path" SYNC_BUSY_EXIT_CODE=75 "$SYNC_CLAUDE_SCRIPT" "$session_id"; then
+                    sync_exit=0
+                else
+                    sync_exit=$?
+                fi
+            elif SYNC_BUSY_EXIT_CODE=75 "$SYNC_CLAUDE_SCRIPT" "$session_id"; then
+                sync_exit=0
+            else
+                sync_exit=$?
+            fi
+            if [ "$sync_exit" -eq 0 ]; then
                 mark_checkpoint "$expected_updated_at" "$source_name" "$session_id" synced
                 processed=$((processed + 1))
             else
-                mark_checkpoint "$expected_updated_at" "$source_name" "$session_id" failed "sync-recall failed"
+                mark_checkpoint "$expected_updated_at" "$source_name" "$session_id" failed "sync-claude failed"
                 failed=$((failed + 1))
             fi
             ;;
         codex)
             if [ -z "$jsonl_path" ]; then
-                mark_checkpoint "$expected_updated_at" "$source_name" "$session_id" failed "codex checkpoint has no jsonl_path"
-                failed=$((failed + 1))
+                # pathなしcheckpointは再試行しても解決しない。daily recoveryがprovider JSONLを直接回収する。
+                mark_checkpoint "$expected_updated_at" "$source_name" "$session_id" synced
+                log_line "Skipped pathless Codex checkpoint: $session_id (daily recovery handles provider JSONL)"
+                skipped=$((skipped + 1))
                 continue
             fi
             if SYNC_BUSY_EXIT_CODE=75 "$SYNC_CODEX_SCRIPT" "$jsonl_path"; then

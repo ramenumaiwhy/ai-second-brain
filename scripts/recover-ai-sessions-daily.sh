@@ -34,7 +34,7 @@ REDACTION_HELPER="${REDACTION_HELPER:-$SCRIPT_DIR/redact-secrets.py}"
 if [ ! -f "$REDACTION_HELPER" ] && [ -f "$PWD/scripts/redact-secrets.py" ]; then
     REDACTION_HELPER="$PWD/scripts/redact-secrets.py"
 fi
-SYNC_RECALL_SCRIPT="${SYNC_RECALL_SCRIPT:-$SCRIPT_DIR/sync-recall-to-obsidian.sh}"
+SYNC_CLAUDE_SCRIPT="${SYNC_CLAUDE_SCRIPT:-${SYNC_RECALL_SCRIPT:-$SCRIPT_DIR/sync-recall-to-obsidian.sh}}"
 SYNC_CODEX_SCRIPT="${SYNC_CODEX_SCRIPT:-$SCRIPT_DIR/sync-codex-to-obsidian.sh}"
 
 if [[ ! "$LOOKBACK_DAYS" =~ ^[0-9]+$ ]] || [[ ! "$MAX_SESSIONS" =~ ^[0-9]+$ ]] || [ "$MAX_SESSIONS" -eq 0 ]; then
@@ -147,11 +147,9 @@ PY
 }
 
 discover_candidates() {
-    local recall_list_file="$1"
-    python3 - "$LOOKBACK_DAYS" "$MAX_SESSIONS" "$CODEX_SESSIONS_DIR" "$CLAUDE_PROJECTS_DIR" "$recall_list_file" "$STATE_FILE" "$SECOND_BRAIN_DIR" "$REDACTION_HELPER" <<'PY'
+    python3 - "$LOOKBACK_DAYS" "$MAX_SESSIONS" "$CODEX_SESSIONS_DIR" "$CLAUDE_PROJECTS_DIR" "$STATE_FILE" "$SECOND_BRAIN_DIR" "$REDACTION_HELPER" <<'PY'
 from __future__ import annotations
 
-import datetime as dt
 import fnmatch
 import hashlib
 import importlib.util
@@ -168,10 +166,9 @@ lookback_days = int(sys.argv[1])
 max_sessions = int(sys.argv[2])
 codex_sessions_dir = Path(sys.argv[3]).expanduser()
 claude_projects_dir = Path(sys.argv[4]).expanduser()
-recall_list_file = sys.argv[5]
-state_file = sys.argv[6]
-second_brain_dir = Path(sys.argv[7]).expanduser() if sys.argv[7] else None
-redaction_helper = Path(sys.argv[8]).expanduser() if sys.argv[8] else None
+state_file = sys.argv[5]
+second_brain_dir = Path(sys.argv[6]).expanduser() if sys.argv[6] else None
+redaction_helper = Path(sys.argv[7]).expanduser() if sys.argv[7] else None
 
 now = time.time()
 cutoff = now - (lookback_days * 86400)
@@ -229,31 +226,6 @@ def load_recent_attempts() -> dict[str, float]:
 
 
 recent_attempts = load_recent_attempts()
-
-
-def parse_epoch(value: object) -> float | None:
-    if isinstance(value, (int, float)):
-        return float(value)
-    if not isinstance(value, str):
-        return None
-    value = value.strip()
-    if not value:
-        return None
-    if value.isdigit():
-        return float(value)
-    try:
-        normalized = value.replace("Z", "+00:00")
-        parsed = dt.datetime.fromisoformat(normalized)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=dt.timezone.utc)
-        return parsed.timestamp()
-    except ValueError:
-        pass
-    try:
-        parsed_date = dt.date.fromisoformat(value)
-        return dt.datetime.combine(parsed_date, dt.time.min, tzinfo=dt.timezone.utc).timestamp()
-    except ValueError:
-        return None
 
 
 def safe_field(value: str) -> bool:
@@ -670,43 +642,6 @@ def walk_jsonl(root: Path, pattern: str) -> list[Path]:
     return paths
 
 
-def add_recall_candidates() -> None:
-    if not recall_list_file:
-        return
-    try:
-        with open(recall_list_file, "r", encoding="utf-8", errors="replace") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return
-    sessions = data.get("sessions", []) if isinstance(data, dict) else data
-    if not isinstance(sessions, list):
-        return
-    timestamp_keys = (
-        "updated_at",
-        "last_message_at",
-        "last_activity_at",
-        "timestamp",
-        "created_at",
-        "date",
-    )
-    for item in sessions:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("source", "")).lower() == "codex":
-            continue
-        session_id = str(item.get("session_id") or item.get("id") or "")
-        modified_at = None
-        for key in timestamp_keys:
-            modified_at = parse_epoch(item.get(key))
-            if modified_at is not None:
-                break
-        if modified_at is None:
-            continue
-        add_candidate("claude", session_id, "", modified_at)
-
-
-add_recall_candidates()
-
 for jsonl_path in walk_jsonl(claude_projects_dir, "*.jsonl"):
     try:
         real_path = os.path.realpath(jsonl_path)
@@ -739,14 +674,11 @@ def candidate_sort_key(row: tuple[float, str, str, str, str]) -> tuple[bool, flo
 
 rows = sorted(candidates.values(), key=candidate_sort_key)[:max_sessions]
 claude_paths_by_session: dict[str, list[str]] = {}
-claude_has_recall_by_session: dict[str, bool] = {}
 for _modified_at, source, session_id, path, _key in candidates.values():
     if source != "claude":
         continue
     if path:
         claude_paths_by_session.setdefault(session_id, []).append(path)
-    else:
-        claude_has_recall_by_session[session_id] = True
 
 claude_bare_path_by_session: dict[str, str] = {}
 for session_id, paths in claude_paths_by_session.items():
@@ -775,7 +707,6 @@ def claude_identity_mode(session_id: str, path: str) -> str:
     )
     has_collision = (
         len(paths) > 1
-        or claude_has_recall_by_session.get(session_id, False)
         or existing_bare_collision
     )
     if not has_collision:
@@ -918,18 +849,9 @@ if ! acquire_lock; then
     exit 0
 fi
 
-recall_list_file=""
-if command -v recall >/dev/null 2>&1; then
-    recall_list_file=$(mktemp "$STATE_DIR/.recall-list.XXXXXX")
-    remember_temp "$recall_list_file"
-    if ! recall list > "$recall_list_file" 2>/dev/null; then
-        recall_list_file=""
-    fi
-fi
-
 candidates_file=$(mktemp "$STATE_DIR/.daily-candidates.XXXXXX")
 remember_temp "$candidates_file"
-discover_candidates "$recall_list_file" > "$candidates_file"
+discover_candidates > "$candidates_file"
 attempted_keys_file=$(mktemp "$STATE_DIR/.daily-attempts.XXXXXX")
 remember_temp "$attempted_keys_file"
 bare_paths_file=$(mktemp "$STATE_DIR/.daily-bare-paths.XXXXXX")
@@ -963,18 +885,18 @@ while IFS=$'\t' read -r source_name session_id jsonl_path _modified_at candidate
             printf '%s\n' "$candidate_key" >> "$attempted_keys_file"
             if [ -n "$jsonl_path" ]; then
                 if [ "$identity_mode" = "path" ]; then
-                    if CLAUDE_SESSION_JSONL_PATH="$jsonl_path" CLAUDE_SESSION_IDENTITY_MODE=path SYNC_BUSY_EXIT_CODE=75 "$SYNC_RECALL_SCRIPT" "$session_id"; then
+                    if CLAUDE_SESSION_JSONL_PATH="$jsonl_path" CLAUDE_SESSION_IDENTITY_MODE=path SYNC_BUSY_EXIT_CODE=75 "$SYNC_CLAUDE_SCRIPT" "$session_id"; then
                         sync_exit=0
                     else
                         sync_exit=$?
                     fi
-                elif CLAUDE_SESSION_JSONL_PATH="$jsonl_path" SYNC_BUSY_EXIT_CODE=75 "$SYNC_RECALL_SCRIPT" "$session_id"; then
+                elif CLAUDE_SESSION_JSONL_PATH="$jsonl_path" SYNC_BUSY_EXIT_CODE=75 "$SYNC_CLAUDE_SCRIPT" "$session_id"; then
                     sync_exit=0
                 else
                     sync_exit=$?
                 fi
             else
-                if SYNC_BUSY_EXIT_CODE=75 "$SYNC_RECALL_SCRIPT" "$session_id"; then
+                if SYNC_BUSY_EXIT_CODE=75 "$SYNC_CLAUDE_SCRIPT" "$session_id"; then
                     sync_exit=0
                 else
                     sync_exit=$?

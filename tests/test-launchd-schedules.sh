@@ -8,6 +8,7 @@ SCRIPT="$REPO_DIR/scripts/install-launchd-schedules.sh"
 TEST_DIR=$(mktemp -d /tmp/test-launchd-schedules-XXXXXX)
 PASS=0
 FAIL=0
+PYCACHE_BEFORE=$(find "$REPO_DIR/scripts" "$REPO_DIR/tests" -path '*/__pycache__/*' -type f -print 2>/dev/null | sort)
 
 cleanup() {
     rm -rf "$TEST_DIR" 2>/dev/null
@@ -77,6 +78,8 @@ mkdir -p "$SECOND_BRAIN"
 SECOND_BRAIN_DIR="$SECOND_BRAIN" \
 AI_LAUNCH_AGENTS_DIR="$AGENTS_DIR" \
 AI_SECOND_BRAIN_STATE_DIR="$STATE_DIR" \
+SYNC_CLAUDE_SCRIPT="$TEST_DIR/claude-sync" \
+SYNC_RECALL_SCRIPT="$TEST_DIR/legacy-claude-sync" \
 AI_LAUNCHD_IDLE_INTERVAL_SECONDS=1200 \
 AI_LAUNCHD_DAILY_HOUR=4 \
 AI_LAUNCHD_DAILY_MINUTE=30 \
@@ -117,6 +120,8 @@ assert_file_contains "daily uses calendar interval" "$DAILY_PLIST" "<key>StartCa
 assert_file_contains "daily hour is configurable" "$DAILY_PLIST" "<integer>4</integer>"
 assert_file_contains "daily minute is configurable" "$DAILY_PLIST" "<integer>30</integer>"
 assert_file_contains "daily preserves custom claude projects dir" "$DAILY_PLIST" "<string>$TEST_DIR/claude-projects</string>"
+assert_file_contains "idle propagates new claude sync override" "$IDLE_PLIST" "<key>SYNC_CLAUDE_SCRIPT</key>"
+assert_file_contains "daily propagates legacy claude sync override" "$DAILY_PLIST" "<key>SYNC_RECALL_SCRIPT</key>"
 assert_file_contains "daily path includes local bin" "$DAILY_PLIST" "$HOME/.local/bin"
 assert_file_contains "daily path includes cargo bin" "$DAILY_PLIST" "$HOME/.cargo/bin"
 assert_file_contains "daily preserves lookback days" "$DAILY_PLIST" "<key>AI_RECOVERY_LOOKBACK_DAYS</key>"
@@ -212,7 +217,8 @@ else
 fi
 assert_file_contains "bad label prefix explains failure" "$TEST_DIR/bad-label.err" "unsupported characters"
 
-if find "$REPO_DIR/scripts" "$REPO_DIR/tests" -name __pycache__ -type d | grep -q .; then
+PYCACHE_AFTER=$(find "$REPO_DIR/scripts" "$REPO_DIR/tests" -path '*/__pycache__/*' -type f -print 2>/dev/null | sort)
+if [ "$PYCACHE_BEFORE" != "$PYCACHE_AFTER" ]; then
     fail "launchd installer avoids pycache"
 else
     pass "launchd installer avoids pycache"

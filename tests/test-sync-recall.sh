@@ -85,11 +85,50 @@ fi
 MOCK_EOF
 chmod +x "$MOCK_BIN/recall"
 
-# テスト用のスクリプトコピーを作成（SYNC_LOG/LOCK_DIRをオーバーライド、OBSIDIAN_DIRは環境変数で制御）
+# テスト用のcoreコピーを作成（SYNC_LOG/LOCK_DIRをオーバーライド）。
+# wrapperは旧テストfixtureをprovider JSONLへ変換し、Recall CLIを呼ばずにcoreへ渡す。
+TEST_CORE="$TEST_DIR/sync-core-under-test.sh"
+sed "s|^SYNC_LOG=.*|SYNC_LOG=\"$TEST_DIR/sync.log\"|; s|^LOCK_DIR=.*|LOCK_DIR=\"$TEST_DIR/lock\"|" "$SCRIPT" > "$TEST_CORE"
 TEST_SCRIPT="$TEST_DIR/sync-under-test.sh"
-sed "s|^SYNC_LOG=.*|SYNC_LOG=\"$TEST_DIR/sync.log\"|; s|^LOCK_DIR=.*|LOCK_DIR=\"$TEST_DIR/lock\"|" "$SCRIPT" > "$TEST_SCRIPT"
+cat > "$TEST_SCRIPT" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+sid="${1:-}"
+if [ -n "$sid" ] && [ -z "${CLAUDE_SESSION_JSONL_PATH:-}" ] && [ -n "${MOCK_RECALL_DATA:-}" ]; then
+    jsonl_path="$CLAUDE_TEST_PROJECTS_DIR/$sid.jsonl"
+    python3 - "$MOCK_RECALL_DATA" "$jsonl_path" "$sid" <<'PY'
+import json
+import os
+import sys
+
+source_path, output_path, session_id = sys.argv[1:4]
+with open(source_path, encoding="utf-8") as handle:
+    data = json.load(handle)
+messages = data.get("messages", [])
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+with open(output_path, "w", encoding="utf-8") as handle:
+    for message in messages:
+        role = message.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        record = {
+            "type": role,
+            "sessionId": session_id,
+            "timestamp": message.get("timestamp") or data.get("timestamp") or "2026-01-01T00:00:00Z",
+            "message": {"role": role, "content": message.get("content", "")},
+        }
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+PY
+    export CLAUDE_PROJECTS_DIR="$CLAUDE_TEST_PROJECTS_DIR"
+    export CLAUDE_SESSION_JSONL_PATH="$jsonl_path"
+fi
+exec /bin/bash "$CLAUDE_TEST_CORE" "$@"
+EOF
 chmod +x "$TEST_SCRIPT"
 mkdir -p "$TEST_DIR/obsidian"
+export CLAUDE_TEST_CORE="$TEST_CORE"
+export CLAUDE_TEST_PROJECTS_DIR="$TEST_DIR/claude-projects"
 export SECOND_BRAIN_DIR="$TEST_DIR/obsidian"
 export REDACTION_HELPER="$SCRIPT_DIR/scripts/redact-secrets.py"
 export AI_LOG_WRITER="$SCRIPT_DIR/scripts/ai-log-writer.py"
@@ -344,6 +383,16 @@ cat > "$TEST_DIR/bulk2.json" << 'EOF'
 }
 EOF
 
+mkdir -p "$CLAUDE_TEST_PROJECTS_DIR"
+cat > "$CLAUDE_TEST_PROJECTS_DIR/test-bulk-001.jsonl" <<'EOF'
+{"type":"user","sessionId":"test-bulk-001","timestamp":"2026-02-09T10:00:00Z","message":{"role":"user","content":"バルクテスト1"}}
+{"type":"assistant","sessionId":"test-bulk-001","timestamp":"2026-02-09T10:00:01Z","message":{"role":"assistant","content":"バルク回答1"}}
+EOF
+cat > "$CLAUDE_TEST_PROJECTS_DIR/test-bulk-002.jsonl" <<'EOF'
+{"type":"user","sessionId":"test-bulk-002","timestamp":"2026-02-09T11:00:00Z","message":{"role":"user","content":"バルクテスト2"}}
+{"type":"assistant","sessionId":"test-bulk-002","timestamp":"2026-02-09T11:00:01Z","message":{"role":"assistant","content":"バルク回答2"}}
+EOF
+
 # mockを書き換え: readの引数でファイルを切り替え
 cat > "$MOCK_BIN/recall" << MOCK_EOF
 #!/bin/bash
@@ -361,7 +410,7 @@ chmod +x "$MOCK_BIN/recall"
 
 rm -rf "$TEST_DIR/lock" 2>/dev/null
 
-bash "$TEST_SCRIPT" 2>&1 && EXIT_CODE6=0 || EXIT_CODE6=$?
+CLAUDE_PROJECTS_DIR="$CLAUDE_TEST_PROJECTS_DIR" bash "$TEST_SCRIPT" 2>&1 && EXIT_CODE6=0 || EXIT_CODE6=$?
 
 assert_eq "exit code is 0" "0" "$EXIT_CODE6"
 assert_file_exists "bulk-001 ファイル生成" "*test-bul*.md"
@@ -400,7 +449,7 @@ chmod +x "$MOCK_BIN/recall"
 
 rm -rf "$TEST_DIR/lock" 2>/dev/null
 
-bash "$TEST_SCRIPT" "test-multiline-001" 2>&1 && EXIT_CODE7=0 || EXIT_CODE7=$?
+MOCK_RECALL_DATA="$TEST_DIR/multiline.json" bash "$TEST_SCRIPT" "test-multiline-001" 2>&1 && EXIT_CODE7=0 || EXIT_CODE7=$?
 
 assert_eq "exit code is 0" "0" "$EXIT_CODE7"
 
@@ -450,7 +499,7 @@ chmod +x "$MOCK_BIN/recall"
 
 rm -rf "$TEST_DIR/lock" 2>/dev/null
 
-bash "$TEST_SCRIPT" "test-multiline-001" 2>&1 && EXIT_CODE8=0 || EXIT_CODE8=$?
+MOCK_RECALL_DATA="$TEST_DIR/multiline_updated.json" bash "$TEST_SCRIPT" "test-multiline-001" 2>&1 && EXIT_CODE8=0 || EXIT_CODE8=$?
 
 assert_eq "exit code is 0" "0" "$EXIT_CODE8"
 
@@ -487,6 +536,14 @@ cat > "$TEST_DIR/symlink-session.json" << 'EOF'
 }
 EOF
 
+SYMLINK_PROJECTS="$SYMLINK_HOME/.claude/projects"
+SYMLINK_JSONL="$SYMLINK_PROJECTS/test-symlink-script-dir.jsonl"
+mkdir -p "$SYMLINK_PROJECTS"
+cat > "$SYMLINK_JSONL" <<'EOF'
+{"type":"user","sessionId":"test-symlink-script-dir","timestamp":"2026-02-12T10:00:00Z","message":{"role":"user","content":"symlink 経由のテスト"}}
+{"type":"assistant","sessionId":"test-symlink-script-dir","timestamp":"2026-02-12T10:00:01Z","message":{"role":"assistant","content":"writer を見つけられます"}}
+EOF
+
 cat > "$MOCK_BIN/recall" << MOCK_EOF
 #!/bin/bash
 if [ "\$1" = "read" ]; then
@@ -504,7 +561,8 @@ rm -rf "$SYMLINK_HOME/.claude/recall-obsidian-sync.lock" 2>/dev/null
     unset REDACTION_HELPER AI_LOG_WRITER
     HOME="$SYMLINK_HOME" \
     SECOND_BRAIN_DIR="$SYMLINK_OBSIDIAN" \
-    MOCK_RECALL_DATA="$TEST_DIR/symlink-session.json" \
+    CLAUDE_PROJECTS_DIR="$SYMLINK_PROJECTS" \
+    CLAUDE_SESSION_JSONL_PATH="$SYMLINK_JSONL" \
     PATH="$MOCK_BIN:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
         "$SYMLINK_BIN/sync-recall-to-obsidian.sh" "test-symlink-script-dir"
 ) 2> "$TEST_DIR/symlink.err" && EXIT_CODE9=0 || EXIT_CODE9=$?

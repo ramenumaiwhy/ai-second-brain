@@ -122,6 +122,48 @@ if [ -n "$jsonl_path" ] && { [ -L "$jsonl_path" ] || [ ! -f "$jsonl_path" ]; }; 
     exit 2
 fi
 
+if [ "$source_name" = "claude" ] && [ -n "$jsonl_path" ]; then
+    CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+    if ! python3 - "$CLAUDE_PROJECTS_DIR" "$jsonl_path" "$session_id" <<'PY'
+import json
+import os
+import sys
+
+root_arg, path_arg, expected_session_id = sys.argv[1:4]
+if os.path.islink(root_arg) or not os.path.isdir(root_arg):
+    sys.exit(1)
+root = os.path.realpath(root_arg)
+path = os.path.realpath(path_arg)
+try:
+    if os.path.commonpath((root, path)) != root or not path.endswith(".jsonl"):
+        sys.exit(1)
+except ValueError:
+    sys.exit(1)
+
+found_session_ids = set()
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for index, line in enumerate(handle):
+            if index >= 100:
+                break
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            value = event.get("sessionId") or event.get("session_id")
+            if value:
+                found_session_ids.add(str(value))
+except OSError:
+    sys.exit(1)
+if found_session_ids and found_session_ids != {expected_session_id}:
+    sys.exit(1)
+PY
+    then
+        printf 'Claude JSONL path or session metadata is invalid: %s\n' "$jsonl_path" >&2
+        exit 2
+    fi
+fi
+
 if [ "$source_name" = "codex" ] && [ -n "$jsonl_path" ]; then
     CODEX_SESSIONS_DIR="${CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
     if ! python3 - "$CODEX_SESSIONS_DIR" "$jsonl_path" "$session_id" <<'PY'

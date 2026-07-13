@@ -3,10 +3,11 @@
 AI との会話を自動で Markdown に保存し、Obsidian などのノートアプリで検索・振り返りできるようにするスクリプト集。
 
 対応ツール:
-- **Claude Code** — `recall` CLI 経由で会話を取得
+- **Claude Code** — provider の JSONL セッションファイルを直接パース
 - **Codex** (OpenAI) — JSONL セッションファイルを直接パース
 - **ChatGPT** — エクスポート JSON を変換
 - **OpenClaw/Himeno** — 重要イベントだけを source page として保存
+- **Hermes Agent** — 回答完了フックから会話を即時保存（cron 不要）
 
 保存レイアウト:
 
@@ -15,6 +16,8 @@ AI との会話を自動で Markdown に保存し、Obsidian などのノート�
 - `AI-Logs/automation/codex/YYYY-MM/<session_id>.md` — Codex Automation の派生ビュー。通常会話の検索からは外す。
 
 Claude Code / Codex の新規 AI ログは原本を `AI-Logs/raw` に保存し、通常会話の派生ビューを `AI-Logs/readable`、Codex Automation の派生ビューを `AI-Logs/automation` に保存する。root 直下の旧 AI ログは互換のため追記対象として残す。ChatGPT 公式エクスポートの変換（`convert_to_obsidian.py`）は現時点では従来どおり root 直下に書く。ChatGPT 変換の移設は別作業として扱う。
+
+ローカルの過去会話検索には `ctx` を使い、長期保存は各providerのJSONLまたはHermesの回答完了フックからSecond Brainへ直接書く。`ctx` は保存処理の依存コマンドではない。検索と保存は意図的に分離している。
 
 ## セットアップ
 
@@ -98,6 +101,8 @@ plist だけを書いて読み込まない場合:
 ~/ai-second-brain/scripts/sync-codex-to-obsidian.sh "$CODEX_JSONL_FILE"
 ```
 
+Claude 同期スクリプトのファイル名にある `recall` は既存hookとの互換性のため残しているだけで、Recall CLIは使用しない。
+
 ### 4.1 Codex の Stop hook に軽量 checkpoint を登録
 
 Codex は `Stop` hook の stdin JSON に `session_id` と `transcript_path` を渡す。`~/.codex/hooks.json` の既存 `Stop` 配列へ次を追加する。既存の `notify` や他の Stop hook は上書きしない。
@@ -160,6 +165,26 @@ JSON
 ```
 
 保存先は `$SECOND_BRAIN_DIR/OpenClaw/sources/`。同じイベントを再実行しても、dedupe key（重複判定キー）で同じ記録として扱われるためファイルは増えない。
+
+### 6.1 Hermes Agent の会話を即時保存
+
+Hermes は `post_llm_call`（回答完了後フック）で、完了した user/assistant の1往復をその場で保存する。cron、idle sync、daily recovery は使わない。
+
+ユーザープラグインを Hermes から見える場所へリンクし、有効化する:
+
+```bash
+ln -s "$PWD/integrations/hermes-second-brain" "$HOME/.hermes/plugins/second-brain"
+hermes plugins enable second-brain --no-allow-tool-override
+```
+
+Hermes Gateway からも保存する場合は、`SECOND_BRAIN_DIR` を `~/.hermes/.env` にも設定する。シェルの `~/.zshrc` だけでは、バックグラウンド起動した Gateway に渡らない場合がある。
+
+保存先:
+
+- raw: `AI-Logs/raw/hermes/YYYY-MM/<session_id>.md`
+- readable: `AI-Logs/readable/hermes/YYYY-MM/<session_id>.md`
+
+直前と同じ `turn_id`（ターン識別子）のフックが即時再実行されても追記しない。保存前に既存の秘密情報 redaction とノイズ除外を通す。
 
 ### 7. Summary を後から更新
 
@@ -292,7 +317,9 @@ applyは全件のhash・mtime・inode・path・衝突を先に検証し、1件�
 | `AI_LAUNCH_AGENTS_DIR` | No | `~/Library/LaunchAgents` | plist 書き込み先 |
 | `AI_RECOVERY_LOOKBACK_DAYS` | No | `3` | daily recovery が見る過去日数 |
 | `AI_RECOVERY_MAX_SESSIONS` | No | `50` | daily recovery 1回あたりの最大候補数 |
-| `CLAUDE_PROJECTS_DIR` | No | `~/.claude/projects` | Claude Code JSONL fallback の場所 |
+| `CLAUDE_PROJECTS_DIR` | No | `~/.claude/projects` | Claude Code JSONL の許可root |
+| `SYNC_CLAUDE_SCRIPT` | No | `scripts/sync-recall-to-obsidian.sh` | idle sync / daily recovery が呼ぶClaude JSONL同期スクリプト |
+| `SYNC_RECALL_SCRIPT` | No | — | 旧設定との互換入力。`SYNC_CLAUDE_SCRIPT`があれば新設定を優先 |
 | `AI_LOG_NOISE_FILTER` | No | `1` | 明示的な heartbeat/cron automation wrapper を省く。`0`, `false`, `no`, `off` で無効 |
 | `AI_LOG_NOISE_PATTERNS_FILE` | No | — | 追加の省略パターンを1行1正規表現で指定 |
 
@@ -301,19 +328,6 @@ applyは全件のhash・mtime・inode・path・衝突を先に検証し、1件�
 - `jq`
 - `python3`
 - `shasum` (macOS 標準)
-- `recall` (サードパーティ CLI。[zippoxer/recall](https://github.com/zippoxer/recall) を参照)
-
-### recall のインストール
-
-```bash
-# Homebrew
-brew install zippoxer/tap/recall
-
-# または Cargo
-cargo install --git https://github.com/zippoxer/recall
-```
-
-recall は必須。同期スクリプトは起動時にコマンドの存在を確認し、無ければ即終了する。`recall read` が失敗した場合の JSONL フォールバックは内蔵しているが、recall 自体のインストールは必要。
 
 ## 注意
 
@@ -327,6 +341,7 @@ recall は必須。同期スクリプトは起動時にコマンドの存在を�
 ```bash
 cd ~/ai-second-brain
 bash tests/test-sync-recall.sh
+bash tests/test-claude-jsonl-sync.sh
 bash tests/test-redaction.sh
 bash tests/test-ai-log-noise-filter.sh
 bash tests/test-idle-sync.sh
@@ -334,6 +349,7 @@ bash tests/test-daily-recovery.sh
 bash tests/test-openclaw-save.sh
 bash tests/test-launchd-schedules.sh
 bash tests/test-summary-refresh.sh
+bash tests/test-hermes-save.sh
 ```
 
 ## ライセンス

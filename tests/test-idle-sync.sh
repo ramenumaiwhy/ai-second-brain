@@ -250,9 +250,9 @@ else
     CODEX_NO_PATH_EXIT=$?
 fi
 
-assert_eq "pathless codex checkpoint makes idle sync fail" "1" "$CODEX_NO_PATH_EXIT"
+assert_eq "pathless codex checkpoint does not poison idle sync" "0" "$CODEX_NO_PATH_EXIT"
 assert_eq "pathless codex checkpoint does not call sync" "0" "$(line_count "$CALL_LOG")"
-assert_json_session_exists "pathless codex checkpoint stays pending" "codex:codex-no-path"
+assert_json_session_missing "pathless codex checkpoint is retired for daily recovery" "codex:codex-no-path"
 
 echo ""
 echo "=== Concurrent checkpoint writes ==="

@@ -163,6 +163,14 @@ printf 'claude\t%s\t%s\n' "$1" "${CLAUDE_SESSION_JSONL_PATH:-}" >> "$SYNC_CALL_L
 EOF
 chmod +x "$FAKE_RECALL_SYNC"
 
+FAKE_LEGACY_IGNORED_SYNC="$TEST_DIR/fake-legacy-ignored-sync.sh"
+cat > "$FAKE_LEGACY_IGNORED_SYNC" <<'EOF'
+#!/bin/bash
+printf 'legacy-should-not-run\t%s\n' "$1" >> "$SYNC_CALL_LOG"
+exit 1
+EOF
+chmod +x "$FAKE_LEGACY_IGNORED_SYNC"
+
 FAKE_CODEX_SYNC="$TEST_DIR/fake-codex-sync.sh"
 cat > "$FAKE_CODEX_SYNC" <<'EOF'
 #!/bin/bash
@@ -226,24 +234,23 @@ AI_RECOVERY_LOOKBACK_DAYS=2 \
 AI_RECOVERY_MAX_SESSIONS=10 \
 CODEX_SESSIONS_DIR="$CODEX_DIR" \
 CLAUDE_PROJECTS_DIR="$CLAUDE_PROJECTS_DIR" \
-SYNC_RECALL_SCRIPT="$FAKE_RECALL_SYNC" \
+SYNC_CLAUDE_SCRIPT="$FAKE_RECALL_SYNC" \
+SYNC_RECALL_SCRIPT="$FAKE_LEGACY_IGNORED_SYNC" \
 SYNC_CODEX_SCRIPT="$FAKE_CODEX_SYNC" \
     "$SCRIPT"
 
-assert_eq "three recent candidates are delegated" "3" "$(line_count "$CALL_LOG")"
-assert_contains "recall recent session is delegated" "$CALL_LOG" "claude	recall-recent"
+assert_eq "two provider JSONL candidates are delegated" "2" "$(line_count "$CALL_LOG")"
 assert_contains "claude jsonl fallback session is delegated" "$CALL_LOG" "claude	fallback-session"
 assert_contains "claude jsonl fallback path is delegated" "$CALL_LOG" "$CLAUDE_PROJECTS_DIR/fallback-session.jsonl"
 assert_contains "recent codex rollout is delegated" "$CALL_LOG" "codex	$REAL_RECENT_CODEX"
-assert_not_contains "old recall session is not delegated" "$CALL_LOG" "recall-old"
-assert_not_contains "recall codex source is excluded" "$CALL_LOG" "recall-codex"
+assert_not_contains "new Claude sync override wins over legacy override" "$CALL_LOG" "legacy-should-not-run"
 assert_not_contains "old codex rollout is not delegated" "$CALL_LOG" "$OLD_CODEX"
 assert_file_exists "daily recovery state is written" "$STATE_DIR/daily-recovery.json"
 assert_eq "state records lookback days" "2" "$(state_value "$STATE_DIR/daily-recovery.json" "lookback_days")"
 assert_eq "state records max sessions" "10" "$(state_value "$STATE_DIR/daily-recovery.json" "max_sessions_per_run")"
-assert_eq "state records candidate count" "3" "$(state_value "$STATE_DIR/daily-recovery.json" "last_report.candidate_count")"
-assert_eq "state records success count" "3" "$(state_value "$STATE_DIR/daily-recovery.json" "last_report.succeeded_count")"
-assert_contains "report is counts only" "$RECOVERY_LOG" "Daily recovery completed: candidates=3 attempted=3 succeeded=3 failed=0 skipped=0"
+assert_eq "state records candidate count" "2" "$(state_value "$STATE_DIR/daily-recovery.json" "last_report.candidate_count")"
+assert_eq "state records success count" "2" "$(state_value "$STATE_DIR/daily-recovery.json" "last_report.succeeded_count")"
+assert_contains "report is counts only" "$RECOVERY_LOG" "Daily recovery completed: candidates=2 attempted=2 succeeded=2 failed=0 skipped=0"
 assert_not_contains "report omits claude transcript content" "$RECOVERY_LOG" "transcript-secret-value"
 assert_not_contains "state omits transcript content" "$STATE_DIR/daily-recovery.json" "transcript-secret-value"
 
@@ -655,6 +662,13 @@ EOF
 
 rm -rf "$CLAUDE_PROJECTS_DIR" "$CODEX_DIR"
 mkdir -p "$CLAUDE_PROJECTS_DIR" "$CODEX_DIR"
+cat > "$CLAUDE_PROJECTS_DIR/rotate-newer.jsonl" <<'EOF'
+{"type":"user","sessionId":"rotate-newer","message":{"role":"user","content":"newer"}}
+EOF
+cat > "$CLAUDE_PROJECTS_DIR/rotate-older.jsonl" <<'EOF'
+{"type":"user","sessionId":"rotate-older","message":{"role":"user","content":"older"}}
+EOF
+set_mtime_offset "$CLAUDE_PROJECTS_DIR/rotate-older.jsonl" -86400
 : > "$CALL_LOG"
 
 MOCK_RECALL_LIST="$ROTATE_RECALL_LIST" \
@@ -762,6 +776,9 @@ chmod +x "$FAKE_FAIL_RECALL_SYNC"
 
 rm -rf "$CLAUDE_PROJECTS_DIR" "$CODEX_DIR"
 mkdir -p "$CLAUDE_PROJECTS_DIR" "$CODEX_DIR"
+cat > "$CLAUDE_PROJECTS_DIR/fail-session.jsonl" <<'EOF'
+{"type":"user","sessionId":"fail-session","message":{"role":"user","content":"fail me"}}
+EOF
 : > "$CALL_LOG"
 
 if MOCK_RECALL_LIST="$FAIL_RECALL_LIST" \

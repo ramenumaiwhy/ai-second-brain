@@ -67,6 +67,40 @@ assert_file_count() {
     fi
 }
 
+run_claude_fixture() {
+    local fixture="$1" notes_dir="$2" session_id="$3"
+    local projects_dir="$TEST_DIR/home/.claude/projects"
+    local jsonl_path="$projects_dir/$session_id.jsonl"
+    mkdir -p "$projects_dir"
+    python3 - "$fixture" "$jsonl_path" "$session_id" <<'PY'
+import json
+import sys
+
+fixture, output, session_id = sys.argv[1:4]
+with open(fixture, encoding="utf-8") as handle:
+    data = json.load(handle)
+with open(output, "w", encoding="utf-8") as handle:
+    for message in data.get("messages", []):
+        role = message.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        record = {
+            "type": role,
+            "sessionId": session_id,
+            "timestamp": message.get("timestamp") or data.get("timestamp") or "2026-01-01T00:00:00Z",
+            "message": {"role": role, "content": message.get("content", "")},
+        }
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+PY
+    HOME="$TEST_DIR/home" \
+    SECOND_BRAIN_DIR="$notes_dir" \
+    CLAUDE_PROJECTS_DIR="$projects_dir" \
+    CLAUDE_SESSION_JSONL_PATH="$jsonl_path" \
+    REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
+    AI_LOG_WRITER="$WRITER" \
+        "$RECALL_SCRIPT" "$session_id"
+}
+
 markdown_count() {
     find "$1" -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' '
 }
@@ -619,56 +653,33 @@ assert_file_contains "shared noisy append records omitted secret-chain count" "$
 echo ""
 echo "=== Claude sync all-filtered session ==="
 
-MOCK_BIN="$TEST_DIR/bin"
-mkdir -p "$MOCK_BIN" "$TEST_DIR/claude-notes" "$TEST_DIR/home/.claude"
-cat > "$MOCK_BIN/recall" <<'EOF'
-#!/bin/bash
-if [ "$1" = "read" ]; then
-    cat "$MOCK_RECALL_DATA"
-elif [ "$1" = "list" ]; then
-    printf '{"sessions":[]}\n'
-fi
-EOF
-chmod +x "$MOCK_BIN/recall"
+CLAUDE_PROJECTS="$TEST_DIR/home/.claude/projects"
+mkdir -p "$TEST_DIR/claude-notes" "$CLAUDE_PROJECTS"
 
-cat > "$TEST_DIR/claude-all-filtered.json" <<'JSON'
-{
-  "session_id": "claude-all-filtered",
-  "source": "claude",
-  "timestamp": "2026-06-03T09:00:00Z",
-  "messages": [
-    {"role": "user", "content": "[cron] no changes"},
-    {"role": "assistant", "content": "Heartbeat automation completed: no changes"}
-  ]
-}
-JSON
+cat > "$CLAUDE_PROJECTS/claude-all-filtered.jsonl" <<'JSONL'
+{"type":"user","sessionId":"claude-all-filtered","timestamp":"2026-06-03T09:00:00Z","message":{"role":"user","content":"[cron] no changes"}}
+{"type":"assistant","sessionId":"claude-all-filtered","timestamp":"2026-06-03T09:00:01Z","message":{"role":"assistant","content":"Heartbeat automation completed: no changes"}}
+JSONL
 
-MOCK_RECALL_DATA="$TEST_DIR/claude-all-filtered.json" \
 HOME="$TEST_DIR/home" \
-PATH="$MOCK_BIN:$PATH" \
 SECOND_BRAIN_DIR="$TEST_DIR/claude-notes" \
+CLAUDE_PROJECTS_DIR="$CLAUDE_PROJECTS" \
+CLAUDE_SESSION_JSONL_PATH="$CLAUDE_PROJECTS/claude-all-filtered.jsonl" \
 REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
 AI_LOG_WRITER="$WRITER" \
     "$RECALL_SCRIPT" "claude-all-filtered"
 
 assert_eq "all-filtered claude session creates no markdown" "0" "$(markdown_count "$TEST_DIR/claude-notes")"
 
-cat > "$TEST_DIR/claude-ordinary.json" <<'JSON'
-{
-  "session_id": "claude-ordinary",
-  "source": "claude",
-  "timestamp": "2026-06-03T09:10:00Z",
-  "messages": [
-    {"role": "user", "content": "cronとheartbeatの保存方針を相談したい"},
-    {"role": "assistant", "content": "普通の会話なので保存する"}
-  ]
-}
-JSON
+cat > "$CLAUDE_PROJECTS/claude-ordinary.jsonl" <<'JSONL'
+{"type":"user","sessionId":"claude-ordinary","timestamp":"2026-06-03T09:10:00Z","message":{"role":"user","content":"cronとheartbeatの保存方針を相談したい"}}
+{"type":"assistant","sessionId":"claude-ordinary","timestamp":"2026-06-03T09:10:01Z","message":{"role":"assistant","content":"普通の会話なので保存する"}}
+JSONL
 
-MOCK_RECALL_DATA="$TEST_DIR/claude-ordinary.json" \
 HOME="$TEST_DIR/home" \
-PATH="$MOCK_BIN:$PATH" \
 SECOND_BRAIN_DIR="$TEST_DIR/claude-notes" \
+CLAUDE_PROJECTS_DIR="$CLAUDE_PROJECTS" \
+CLAUDE_SESSION_JSONL_PATH="$CLAUDE_PROJECTS/claude-ordinary.jsonl" \
 REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
 AI_LOG_WRITER="$WRITER" \
     "$RECALL_SCRIPT" "claude-ordinary"
@@ -996,13 +1007,7 @@ cat > "$TEST_DIR/claude-legacy-append.json" <<'JSON'
 }
 JSON
 
-MOCK_RECALL_DATA="$TEST_DIR/claude-legacy-append.json" \
-HOME="$TEST_DIR/home" \
-PATH="$MOCK_BIN:$PATH" \
-SECOND_BRAIN_DIR="$CLAUDE_LEGACY_DIR" \
-REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
-AI_LOG_WRITER="$WRITER" \
-    "$RECALL_SCRIPT" "claude-legacy-noise"
+run_claude_fixture "$TEST_DIR/claude-legacy-append.json" "$CLAUDE_LEGACY_DIR" "claude-legacy-noise"
 
 assert_file_contains "legacy claude append keeps existing noisy entry" "$LEGACY_CLAUDE_MD" "[cron] no changes"
 assert_file_contains "legacy claude append adds useful answer" "$LEGACY_CLAUDE_MD" "real answer"
@@ -1023,13 +1028,7 @@ cat > "$TEST_DIR/claude-legacy-followup.json" <<'JSON'
 }
 JSON
 
-MOCK_RECALL_DATA="$TEST_DIR/claude-legacy-followup.json" \
-HOME="$TEST_DIR/home" \
-PATH="$MOCK_BIN:$PATH" \
-SECOND_BRAIN_DIR="$CLAUDE_LEGACY_DIR" \
-REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
-AI_LOG_WRITER="$WRITER" \
-    "$RECALL_SCRIPT" "claude-legacy-noise"
+run_claude_fixture "$TEST_DIR/claude-legacy-followup.json" "$CLAUDE_LEGACY_DIR" "claude-legacy-noise"
 
 assert_file_contains "legacy claude noisy chain adds follow up" "$LEGACY_CLAUDE_MD" "claude follow up after noise"
 assert_file_count "legacy claude noisy chain does not duplicate answer" "$LEGACY_CLAUDE_MD" "real answer" "1"
@@ -1068,13 +1067,7 @@ cat > "$TEST_DIR/claude-legacy-qa-append.json" <<'JSON'
 }
 JSON
 
-MOCK_RECALL_DATA="$TEST_DIR/claude-legacy-qa-append.json" \
-HOME="$TEST_DIR/home" \
-PATH="$MOCK_BIN:$PATH" \
-SECOND_BRAIN_DIR="$CLAUDE_LEGACY_DIR" \
-REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
-AI_LOG_WRITER="$WRITER" \
-    "$RECALL_SCRIPT" "claude-legacy-qa-noise"
+run_claude_fixture "$TEST_DIR/claude-legacy-qa-append.json" "$CLAUDE_LEGACY_DIR" "claude-legacy-qa-noise"
 
 assert_file_contains "legacy Q/A claude append adds first useful answer" "$LEGACY_QA_CLAUDE_MD" "real answer 1"
 assert_file_contains "legacy Q/A claude append adds second useful answer" "$LEGACY_QA_CLAUDE_MD" "real answer 2"
@@ -1106,13 +1099,7 @@ cat > "$TEST_DIR/claude-legacy-qa-shift.json" <<'JSON'
 }
 JSON
 
-MOCK_RECALL_DATA="$TEST_DIR/claude-legacy-qa-shift.json" \
-HOME="$TEST_DIR/home" \
-PATH="$MOCK_BIN:$PATH" \
-SECOND_BRAIN_DIR="$CLAUDE_LEGACY_DIR" \
-REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
-AI_LOG_WRITER="$WRITER" \
-    "$RECALL_SCRIPT" "claude-legacy-qa-shift"
+run_claude_fixture "$TEST_DIR/claude-legacy-qa-shift.json" "$CLAUDE_LEGACY_DIR" "claude-legacy-qa-shift"
 
 assert_file_contains "legacy Q/A claude shifted append adds answer" "$LEGACY_QA_SHIFT_CLAUDE_MD" "shifted answer"
 assert_file_count "legacy Q/A claude shifted append does not duplicate saved task" "$LEGACY_QA_SHIFT_CLAUDE_MD" "real shifted task" "1"
@@ -1152,13 +1139,7 @@ cat > "$TEST_DIR/claude-legacy-qa-interleaved-append1.json" <<'JSON'
 }
 JSON
 
-MOCK_RECALL_DATA="$TEST_DIR/claude-legacy-qa-interleaved-append1.json" \
-HOME="$TEST_DIR/home" \
-PATH="$MOCK_BIN:$PATH" \
-SECOND_BRAIN_DIR="$CLAUDE_LEGACY_DIR" \
-REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
-AI_LOG_WRITER="$WRITER" \
-    "$RECALL_SCRIPT" "claude-legacy-qa-interleaved"
+run_claude_fixture "$TEST_DIR/claude-legacy-qa-interleaved-append1.json" "$CLAUDE_LEGACY_DIR" "claude-legacy-qa-interleaved"
 
 cat > "$TEST_DIR/claude-legacy-qa-interleaved-append2.json" <<'JSON'
 {
@@ -1175,13 +1156,7 @@ cat > "$TEST_DIR/claude-legacy-qa-interleaved-append2.json" <<'JSON'
 }
 JSON
 
-MOCK_RECALL_DATA="$TEST_DIR/claude-legacy-qa-interleaved-append2.json" \
-HOME="$TEST_DIR/home" \
-PATH="$MOCK_BIN:$PATH" \
-SECOND_BRAIN_DIR="$CLAUDE_LEGACY_DIR" \
-REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
-AI_LOG_WRITER="$WRITER" \
-    "$RECALL_SCRIPT" "claude-legacy-qa-interleaved"
+run_claude_fixture "$TEST_DIR/claude-legacy-qa-interleaved-append2.json" "$CLAUDE_LEGACY_DIR" "claude-legacy-qa-interleaved"
 
 assert_file_contains "legacy Q/A interleaved append adds follow up" "$LEGACY_QA_INTERLEAVED_MD" "interleaved follow up"
 assert_file_count "legacy Q/A interleaved append does not duplicate answer" "$LEGACY_QA_INTERLEAVED_MD" "interleaved answer" "1"
@@ -1216,13 +1191,7 @@ cat > "$TEST_DIR/claude-legacy-qa-no-count.json" <<'JSON'
 }
 JSON
 
-MOCK_RECALL_DATA="$TEST_DIR/claude-legacy-qa-no-count.json" \
-HOME="$TEST_DIR/home" \
-PATH="$MOCK_BIN:$PATH" \
-SECOND_BRAIN_DIR="$CLAUDE_LEGACY_DIR" \
-REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
-AI_LOG_WRITER="$WRITER" \
-    "$RECALL_SCRIPT" "claude-legacy-qa-no-count"
+run_claude_fixture "$TEST_DIR/claude-legacy-qa-no-count.json" "$CLAUDE_LEGACY_DIR" "claude-legacy-qa-no-count"
 
 assert_file_contains "legacy Q/A no-count append adds answer" "$LEGACY_QA_NO_COUNT_MD" "no-count answer"
 assert_file_count "legacy Q/A no-count append does not duplicate saved task" "$LEGACY_QA_NO_COUNT_MD" "real no-count task" "1"
@@ -1257,13 +1226,7 @@ cat > "$TEST_DIR/claude-legacy-qa-no-count-saved-noise.json" <<'JSON'
 }
 JSON
 
-MOCK_RECALL_DATA="$TEST_DIR/claude-legacy-qa-no-count-saved-noise.json" \
-HOME="$TEST_DIR/home" \
-PATH="$MOCK_BIN:$PATH" \
-SECOND_BRAIN_DIR="$CLAUDE_LEGACY_DIR" \
-REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
-AI_LOG_WRITER="$WRITER" \
-    "$RECALL_SCRIPT" "claude-legacy-qa-no-count-saved-noise"
+run_claude_fixture "$TEST_DIR/claude-legacy-qa-no-count-saved-noise.json" "$CLAUDE_LEGACY_DIR" "claude-legacy-qa-no-count-saved-noise"
 
 assert_file_contains "legacy Q/A no-count saved-noise appends first answer" "$LEGACY_QA_NO_COUNT_SAVED_NOISE_MD" "saved-noise answer 1"
 assert_file_contains "legacy Q/A no-count saved-noise appends second answer" "$LEGACY_QA_NO_COUNT_SAVED_NOISE_MD" "saved-noise answer 2"
@@ -1299,13 +1262,7 @@ cat > "$TEST_DIR/claude-legacy-qa-empty-append1.json" <<'JSON'
 }
 JSON
 
-MOCK_RECALL_DATA="$TEST_DIR/claude-legacy-qa-empty-append1.json" \
-HOME="$TEST_DIR/home" \
-PATH="$MOCK_BIN:$PATH" \
-SECOND_BRAIN_DIR="$CLAUDE_LEGACY_DIR" \
-REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
-AI_LOG_WRITER="$WRITER" \
-    "$RECALL_SCRIPT" "claude-legacy-qa-empty"
+run_claude_fixture "$TEST_DIR/claude-legacy-qa-empty-append1.json" "$CLAUDE_LEGACY_DIR" "claude-legacy-qa-empty"
 
 cat > "$TEST_DIR/claude-legacy-qa-empty-append2.json" <<'JSON'
 {
@@ -1321,17 +1278,11 @@ cat > "$TEST_DIR/claude-legacy-qa-empty-append2.json" <<'JSON'
 }
 JSON
 
-MOCK_RECALL_DATA="$TEST_DIR/claude-legacy-qa-empty-append2.json" \
-HOME="$TEST_DIR/home" \
-PATH="$MOCK_BIN:$PATH" \
-SECOND_BRAIN_DIR="$CLAUDE_LEGACY_DIR" \
-REDACTION_HELPER="$REPO_DIR/scripts/redact-secrets.py" \
-AI_LOG_WRITER="$WRITER" \
-    "$RECALL_SCRIPT" "claude-legacy-qa-empty"
+run_claude_fixture "$TEST_DIR/claude-legacy-qa-empty-append2.json" "$CLAUDE_LEGACY_DIR" "claude-legacy-qa-empty"
 
 assert_file_contains "legacy Q/A empty append adds follow up" "$LEGACY_QA_EMPTY_MD" "empty chain follow"
 assert_file_count "legacy Q/A empty append does not duplicate answer" "$LEGACY_QA_EMPTY_MD" "empty chain answer" "1"
-assert_file_contains "legacy Q/A empty append updates raw message count" "$LEGACY_QA_EMPTY_MD" "msg_count: 4"
+assert_file_contains "legacy Q/A empty append counts non-empty messages" "$LEGACY_QA_EMPTY_MD" "msg_count: 3"
 
 echo ""
 echo "================================"

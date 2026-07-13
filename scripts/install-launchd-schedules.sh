@@ -162,7 +162,7 @@ plist_env_pair() {
 
 plist_optional_env_pair() {
     local key="$1" value
-    value=$(printenv "$key" 2>/dev/null || true)
+    value="${!key:-}"
     if [ -n "$value" ]; then
         plist_env_pair "$key" "$value"
     fi
@@ -205,6 +205,7 @@ write_environment() {
     plist_optional_env_pair "AI_RECOVERY_MAX_SESSIONS"
     plist_optional_env_pair "AI_DAILY_RECOVERY_LOG"
     plist_optional_env_pair "REDACTION_HELPER"
+    plist_optional_env_pair "SYNC_CLAUDE_SCRIPT"
     plist_optional_env_pair "SYNC_RECALL_SCRIPT"
     plist_optional_env_pair "SYNC_CODEX_SCRIPT"
     printf '%s\n' '  </dict>'
