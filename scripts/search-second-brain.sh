@@ -6,6 +6,7 @@ set -euo pipefail
 OBSIDIAN_DIR="${SECOND_BRAIN_DIR:?'Error: SECOND_BRAIN_DIR is not set. Set it to your notes directory.'}"
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FILE_LISTER="${SEARCH_FILE_LISTER:-$SCRIPT_DIR/list-searchable-second-brain.py}"
+PYTHON_BIN="${SECOND_BRAIN_PYTHON:-python3}"
 
 if [ "$#" -eq 0 ]; then
     printf 'usage: %s <rg args>\n' "$(basename "$0")" >&2
@@ -17,16 +18,21 @@ if [ ! -f "$FILE_LISTER" ]; then
     exit 2
 fi
 
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    printf 'Second Brain Python runtime not found: %s\n' "$PYTHON_BIN" >&2
+    exit 2
+fi
+
 file_list=$(mktemp "${TMPDIR:-/tmp}/ai-second-brain-search.XXXXXX")
 trap 'rm -f "$file_list"' EXIT
 
-python3 "$FILE_LISTER" --root "$OBSIDIAN_DIR" > "$file_list"
+"$PYTHON_BIN" "$FILE_LISTER" --root "$OBSIDIAN_DIR" > "$file_list"
 if [ ! -s "$file_list" ]; then
     printf 'No local files are available in the default Second Brain search scope.\n' >&2
     exit 0
 fi
 
-python3 - "$file_list" "$@" <<'PY'
+"$PYTHON_BIN" - "$file_list" "$@" <<'PY'
 import os
 import stat
 import subprocess

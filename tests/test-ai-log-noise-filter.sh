@@ -256,6 +256,7 @@ mkdir -p "$SEARCH_NOTES/AI-Logs/raw/codex/2026-06" \
     "$SEARCH_NOTES/AI-Logs/readable/codex/2026-06" \
     "$SEARCH_NOTES/AI-Logs/automation/codex/2026-06" \
     "$SEARCH_NOTES/OpenClaw/sources" \
+    "$SEARCH_NOTES/OpenClaw/raw/conversations" \
     "$SEARCH_NOTES/plans"
 printf 'search-helper-needle raw\n' > "$SEARCH_NOTES/AI-Logs/raw/codex/2026-06/raw.md"
 printf 'search-helper-needle archive\n' > "$SEARCH_NOTES/AI-Logs/raw-archive/codex/2026-06/archive.md"
@@ -264,6 +265,7 @@ printf 'search-helper-needle automation\n' > "$SEARCH_NOTES/AI-Logs/automation/c
 printf 'search-helper-needle legacy\n' > "$SEARCH_NOTES/2026-06-03_legacy.md"
 printf 'search-helper-needle root-human\n' > "$SEARCH_NOTES/README.md"
 printf 'search-helper-needle openclaw\n' > "$SEARCH_NOTES/OpenClaw/sources/result.md"
+printf 'search-helper-needle openclaw-raw\n' > "$SEARCH_NOTES/OpenClaw/raw/conversations/raw.md"
 printf 'search-helper-needle binary-like\n' > "$SEARCH_NOTES/OpenClaw/sources/result.bin"
 printf 'search-helper-needle plan\n' > "$SEARCH_NOTES/plans/plan.md"
 SEARCH_OUTPUT=$(SECOND_BRAIN_DIR="$SEARCH_NOTES" "$SEARCH_SCRIPT" "search-helper-needle")
@@ -287,6 +289,7 @@ assert_text_not_contains() {
 assert_text_contains "search helper includes readable" "$SEARCH_OUTPUT" "readable"
 assert_text_contains "search helper includes root human note" "$SEARCH_OUTPUT" "root-human"
 assert_text_contains "search helper includes OpenClaw" "$SEARCH_OUTPUT" "openclaw"
+assert_text_not_contains "search helper excludes OpenClaw raw" "$SEARCH_OUTPUT" "openclaw-raw"
 assert_text_contains "search helper includes plans" "$SEARCH_OUTPUT" "plan"
 assert_text_not_contains "search helper excludes raw" "$SEARCH_OUTPUT" " raw"
 assert_text_not_contains "search helper excludes archive" "$SEARCH_OUTPUT" "archive"
@@ -298,9 +301,12 @@ SECOND_BRAIN_DIR="$SEARCH_NOTES" "$SEARCH_SCRIPT" "definitely-not-present" >/dev
 SEARCH_NO_MATCH_EXIT=$?
 SECOND_BRAIN_DIR="$SEARCH_NOTES" "$SEARCH_SCRIPT" --definitely-invalid >/dev/null 2>&1
 SEARCH_INVALID_EXIT=$?
+SECOND_BRAIN_DIR="$SEARCH_NOTES" SECOND_BRAIN_PYTHON=/definitely/missing/python "$SEARCH_SCRIPT" "search-helper-needle" >/dev/null 2>&1
+SEARCH_MISSING_PYTHON_EXIT=$?
 set -e
 assert_eq "search helper preserves rg no-match exit" "1" "$SEARCH_NO_MATCH_EXIT"
 assert_eq "search helper preserves rg argument error exit" "2" "$SEARCH_INVALID_EXIT"
+assert_eq "search helper rejects a missing Python override" "2" "$SEARCH_MISSING_PYTHON_EXIT"
 assert_eq "search lister detects dataless stat flag" "1 0 1" "$(python3 - "$SEARCH_LISTER" <<'PY'
 import importlib.util
 from pathlib import Path

@@ -35,7 +35,7 @@ def is_searchable_file(path: Path) -> bool:
         return False
 
 
-def iter_tree_files(directory: Path):
+def iter_tree_files(directory: Path, excluded_root_dirs: frozenset[str] = frozenset()):
     if directory.is_symlink() or not directory.is_dir():
         return
     for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
@@ -44,6 +44,7 @@ def iter_tree_files(directory: Path):
             name
             for name in dirnames
             if not (base / name).is_symlink()
+            and not (base == directory and name in excluded_root_dirs)
         )
         for filename in sorted(filenames):
             path = base / filename
@@ -59,7 +60,8 @@ def iter_searchable_files(root: Path):
             yield path
 
     for relative in SEARCH_DIRS:
-        yield from iter_tree_files(root / relative)
+        excluded_root_dirs = frozenset({"raw"}) if relative == Path("OpenClaw") else frozenset()
+        yield from iter_tree_files(root / relative, excluded_root_dirs)
 
 
 def main() -> int:
